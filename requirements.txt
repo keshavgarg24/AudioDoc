@@ -1,0 +1,71 @@
+# Runtime dependencies.
+#
+# Pinned to exact versions rather than floors. These are the versions the
+# detector's accuracy was confirmed against, and two of them are load bearing
+# in ways a range would not protect:
+#
+#   transformers  MERT is loaded through trust_remote_code, so the checkpoint
+#                 carries code that expects a specific API. 4.45 moved parts
+#                 of it and the load fails.
+#   torch         weights are unpickled; the format is stable, but the ops the
+#                 backbone lowers to are not, and a minor bump has changed CPU
+#                 numerics before.
+#
+# A `>=` here means an image rebuilt six months from now runs a model nobody
+# tested. Bump deliberately, re-run docs/testing.md against labelled audio, then
+# commit the new pin.
+#
+# Install torch/torchaudio from the CPU index or pip resolves to the CUDA
+# build (~2.5 GB against ~200 MB) even on a machine with no GPU:
+#   pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+
+# --- beat tracking ---------------------------------------------------------
+# Installed from the archive because it is not published to PyPI under a
+# version that matches upstream's current API.
+#
+# Written as a PEP 508 direct reference ("name @ url") rather than a bare URL.
+# A bare URL is valid to `pip install -r` but NOT a parseable requirement, and
+# pyproject reads this file for `dynamic = ["dependencies"]` - so the bare form
+# made every wheel and `pip install -e .` fail with InvalidRequirement.
+beat_this @ https://github.com/CPJKU/beat_this/archive/main.zip
+
+# --- inference -------------------------------------------------------------
+torch==2.14.0
+torchaudio==2.11.0
+pytorch-lightning==2.6.5
+transformers==4.44.2
+torchmetrics==1.9.0
+huggingface_hub==0.36.2
+
+# --- level 1: the screen tier ----------------------------------------------
+# ONNX Runtime carries the two small Level-1 detectors (~1.2 MB of weights
+# against Stage-1's 1.29 GB). 1.17 is a floor rather than a pin because the
+# graphs are plain float32 and every release since has run them identically;
+# it is also the first release with the INT8 MMLA and BF16 SGEMM kernels that
+# make a Graviton3+ deployment worthwhile.
+onnxruntime>=1.17,<2
+
+# Optional, and genuinely optional: without it the C2PA screen reports
+# "not installed" and the other Level-1 stages are unaffected. A signed
+# manifest naming a generative tool is one of very few decisive signals
+# available, so it is worth the dependency where it can be installed.
+# c2pa-python==0.16.2
+
+# --- signal analysis -------------------------------------------------------
+librosa==0.11.0
+soundfile==0.14.0
+numpy==2.4.6
+scipy==1.17.1
+pyloudnorm==0.2.0
+
+# --- service ---------------------------------------------------------------
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+python-multipart==0.0.32
+requests==2.34.2
+
+# --- persistence and artifact storage --------------------------------------
+# Both optional at runtime: the service starts and serves without
+# LABS_MONGO_URI or LABS_MODELS_S3_URI set.
+pymongo==4.18.0
+boto3==1.43.89

@@ -1,0 +1,71 @@
+# Secrets. Never commit a filled-in environment file.
+.env
+*.env
+!.env.example
+deploy/.env
+deploy/tls/
+*.pem
+*.key
+
+# Model weights and caches
+checkpoints/
+models/
+*.ckpt
+*.pt
+*.pth
+
+#testing audio
+audio
+
+# Test fixtures: audio is not committed
+tests/fixtures/audio/*
+!tests/fixtures/audio/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.mypy_cache/
+
+# Terraform
+#
+# .terraform/ holds the downloaded provider binaries - 659 MB for the AWS
+# provider alone, and machine-specific.
+#
+# State is excluded because it holds RESOLVED SECRET VALUES in plaintext, and
+# because a state file in git means two people applying concurrently silently
+# overwrite each other's infrastructure. Use an S3 backend with DynamoDB
+# locking instead.
+#
+# .tfvars is excluded because that is where account ids, subnet ids and secret
+# ARNs get written while iterating.
+#
+# .terraform.lock.hcl is deliberately NOT ignored: it pins provider versions
+# and hashes, and committing it is what makes a plan reproducible.
+deploy/aws/.terraform/
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

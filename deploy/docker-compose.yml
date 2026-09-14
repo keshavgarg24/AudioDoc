@@ -1,0 +1,138 @@
+# Production compose file.
+#
+# One API container plus nginx as the TLS terminator and request-size gate.
+# Model weights live on a named volume so a container replacement does not
+# re-download them.
+#
+# Copy .env.example to .env and fill it in before bringing this up.
+
+name: labs
+
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      # Both tiers in one process: Level 1 inline, Level 2 on the in-process
+      # job queue. For the split topology (a free-tier fleet in front of a
+      # worker fleet) build --target screen and --target worker instead;
+      # see docs/deployment.md.
+      target: api
+    image: labs-api:${LABS_IMAGE_TAG:-latest}
+    restart: unless-stopped
+
+    env_file: .env
+
+    environment:
+      # Torch intra-op threads. The backbone is GEMM-bound and two
+      # hyperthreads sharing one core's vector units contend rather than
+      # scale, so this is the PHYSICAL core count - half the vCPU count on
+      # every current x86 instance type. Set it to match your host.
+      LABS_TORCH_THREADS: ${LABS_TORCH_THREADS:-4}
+      LABS_MAX_CONCURRENCY: ${LABS_MAX_CONCURRENCY:-2}
+      LABS_JOB_WORKERS: ${LABS_JOB_WORKERS:-2}
+      LABS_EAGER_LOAD: "true"
+      # Refuse to reach the model hub at runtime. Weights are mirrored into
+      # the volume ahead of time, so a missing file should fail loudly rather
+      # than quietly pulling gigabytes mid-deploy.
+      LABS_OFFLINE: ${LABS_OFFLINE:-true}
+      OMP_NUM_THREADS: ${LABS_TORCH_THREADS:-4}
+      MKL_NUM_THREADS: ${LABS_TORCH_THREADS:-4}
+
+    volumes:
+      - models:/models
+
+    expose:
+      - "8000"
+
+    # Must exceed LABS_SHUTDOWN_DRAIN_S, or the drain is a lie: Docker's
+    # default grace period is 10 seconds, after which the container is
+    # SIGKILLed mid-analysis and the cleanup the drain exists to run - freeing
+    # the staged upload and the caller's concurrency slot - never happens.
+    stop_grace_period: ${LABS_STOP_GRACE:-45s}
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 300s
+      retries: 5
+
+    deploy:
+      resources:
+        limits:
+          # The model is resident for the life of the process; this is a
+          # ceiling that catches a leak, not a working-set estimate.
+          memory: ${LABS_MEMORY_LIMIT:-12g}
+
+    # The process parses untrusted audio with ffmpeg and libsndfile. Dropping
+    # capabilities and blocking privilege escalation costs nothing and bounds
+    # what a parser bug can reach.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./tls:/etc/nginx/tls:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+
+  # ───────────────────────────────────────────────────── screen only ──
+  # A free-tier-only container: ~350 MB, no torch, no weights to mirror,
+  # ready in under a second. Useful as an edge fleet in front of a deep
+  # fleet, or on its own if the screen is all you need.
+  #
+  #   docker compose -f deploy/docker-compose.yml --profile screen up -d
+  #
+  # Behind a profile so a plain `up -d` still brings up only the API, which
+  # is what the single-container deployment wants.
+  screen:
+    profiles: ["screen"]
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: screen
+    image: labs-screen:${LABS_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      LABS_EAGER_LOAD: "false"
+      # One in-flight screen per core. Level 1 is a short GEMM-bound burst,
+      # so past the core count ORT's own intra-op threads and ours contend
+      # for the same vector units.
+      LABS_SCREEN_CONCURRENCY: ${LABS_SCREEN_CONCURRENCY:-4}
+    ports:
+      - "8001:8000"
+    healthcheck:
+      # /v1/ready, not /health: a screen container is ready as soon as its
+      # two ORT sessions exist, so the strict probe is correct and fast.
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/v1/ready"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+volumes:
+  models:
+    driver: local

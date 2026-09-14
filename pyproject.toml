@@ -1,0 +1,95 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "labs"
+version = "1.0.0"
+description = "Audio intelligence API: AI-generated music detection, signal analysis and measurement tools."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "Beat22" }]
+keywords = ["audio", "music", "analysis", "detection", "api"]
+
+classifiers = [
+  "Private :: Do Not Upload",
+  "Programming Language :: Python :: 3.11",
+  "Framework :: FastAPI",
+]
+
+# Runtime pins live in requirements.txt, which is what the image installs.
+# Duplicating them here would create two sources of truth that drift.
+dynamic = ["dependencies"]
+
+[project.scripts]
+labs = "labs.__main__:main"
+labs-keys = "labs.cli.manage_keys:main"
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+# The Level-1 weights are 1.2 MB of package data. Without this they are left
+# out of a wheel and the free tier is broken in any install that is not a
+# source checkout - which is every install that matters.
+[tool.setuptools.package-data]
+"labs.screen" = ["weights/*.onnx"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["labs*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+# Real-model tests load a multi-gigabyte checkpoint and fetch the backbone on
+# first run, which takes minutes. They are opt-in: pytest -m slow
+addopts = "-m 'not slow' --strict-markers"
+markers = [
+  "slow: real model inference over audio; loads checkpoints and may download weights",
+  "integration: exercises the full ASGI app through TestClient",
+  "stress: adversarial input, concurrency and resource-exhaustion probes",
+]
+filterwarnings = [
+  "ignore::DeprecationWarning",
+  "ignore::UserWarning",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# UP is deliberately not selected. Its rules are version modernisation -
+# typing.Dict to dict, Optional[X] to X | None - which touch nearly every
+# annotation in the package for no behavioural change. Enabling them turns
+# every future diff into a reformatting diff and buries the findings that
+# do matter (F, B, S) under several hundred style hits. Revisit as a single
+# deliberate migration, not as lint noise on unrelated work.
+select = ["E", "F", "W", "I", "B", "S"]
+ignore = [
+  "E501",  # line length is handled by the formatter
+  "B008",  # FastAPI's Depends()/File() in defaults is the documented idiom
+  "S101",  # assert is how tests assert
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S", "B"]
+# Upstream research code, kept byte-compatible with the trained checkpoints.
+"src/labs/ml/architecture.py" = ["E", "F", "W", "I", "B", "UP", "S"]
+"src/labs/audio/segmentation.py" = ["E", "F", "W", "I", "B", "UP", "S"]
+# Binding 0.0.0.0 is the point: the process serves from inside a container
+# and is reached through the published port, never from the host directly.
+"src/labs/__main__.py" = ["S104"]
+# The ffmpeg invocation. Arguments are built here from validated settings and
+# a tempfile path, never from request data, and shell=False throughout - which
+# is what S603 is actually asking about.
+"src/labs/analysis/production.py" = ["S603", "S607"]
+# Ordered fallbacks: try one decoder, move to the next. There is no error to
+# report until every option has been tried, and the caller raises then.
+"src/labs/analysis/audio.py" = ["S110"]
+# ffprobe, for the container screen. The only interpolated value is a path the
+# service itself created while staging the upload; shell=False, fixed argv,
+# and a timeout. Same reasoning as production.py above.
+"src/labs/screen/decode.py" = ["S603", "S607"]

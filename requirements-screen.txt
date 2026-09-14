@@ -1,0 +1,47 @@
+# Level-1 only. NO torch, NO transformers, NO pytorch-lightning.
+#
+# This is not a convenience split, it is the point of the tier. The deep image
+# carries ~2.5 GB of wheels because MERT is a torch model loaded through
+# trust_remote_code; Level 1 is two ONNX graphs totalling 1.2 MB over numpy,
+# scipy and librosa. Installing only this set produces a ~350 MB image instead
+# of ~2.5 GB, and on an autoscaling fleet image size IS cold-start latency:
+# pulling 2.5 GB from ECR is tens of seconds before the process even starts.
+#
+# Build it with:  docker build --target screen -t labs-screen .
+#
+# A container built this way serves POST /v1/screen, GET /v1/health and
+# GET /v1/ready. Every deep route returns 503 rather than crashing, because
+# the detector import is deferred (see api/v1/analyses.get_detector).
+
+# --- inference -------------------------------------------------------------
+# Floor rather than pin: the Level-1 graphs are plain float32 and every release
+# since 1.17 runs them identically. 1.17 is also the first with the INT8 MMLA
+# and BF16 SGEMM kernels that matter on Graviton3 and newer.
+onnxruntime>=1.17,<2
+
+# --- signal analysis -------------------------------------------------------
+# Pinned to match requirements.txt exactly. The fakeprint and the CQT cepstrum
+# must come out bit-comparable in both images, or the free tier and the full
+# report disagree about the same file for no reason a user could understand.
+librosa==0.11.0
+soundfile==0.14.0
+numpy==2.4.6
+scipy==1.17.1
+
+# --- service ---------------------------------------------------------------
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+python-multipart==0.0.32
+requests==2.34.2
+
+# --- persistence (optional at runtime) -------------------------------------
+# Present so a screen-only container can still record usage and read the
+# shared job collection. Both are inert until their env vars are set.
+pymongo==4.18.0
+boto3==1.43.89
+
+# --- optional --------------------------------------------------------------
+# Content credentials. Uncomment to enable the C2PA screen, which is the one
+# decisive signal in this tier: a signed manifest naming a generative tool is
+# a declaration, not an inference.
+# c2pa-python==0.16.2
