@@ -9,6 +9,7 @@ Budget about **90 minutes** the first time, most of it waiting for image
 pushes and the MongoDB cluster.
 
 - [0. What you need first](#0-what-you-need-first)
+- [0.5 Create the VPC and network prerequisites](#05-create-the-vpc-and-network-prerequisites)
 - [1. Account and region](#1-account-and-region)
 - [2. MongoDB](#2-mongodb)
 - [3. Secrets](#3-secrets)
@@ -41,18 +42,217 @@ when the licence changed:
 brew install hashicorp/tap/terraform
 ```
 
-In the AWS account, **already existing**, because this Terraform deliberately
-does not create them:
-
-| Thing | Why it is not in the Terraform |
-|---|---|
-| A VPC with 2+ private and 2+ public subnets | Almost always shared and pre-existing. A module that insists on making its own is one you cannot adopt incrementally. |
-| NAT gateway or VPC endpoints for the private subnets | The workers need to reach S3, SQS, ECR and Secrets Manager. Without egress they start and hang. |
-| An ACM certificate, if you want HTTPS | Tied to a domain you own. |
+The Terraform deliberately does not create the VPC, subnets, NAT or
+certificate — those belong to the account, not to one service. If your testing
+account already has a VPC with private subnets and a NAT gateway, skip to
+[section 1](#1-account-and-region) and just collect the IDs. If starting from a
+blank account, section 0.5 builds everything from scratch in about ten minutes.
 
 > **Check the NAT before anything else.** A private subnet with no route out is
 > the single most common reason a first deploy hangs with tasks stuck in
-> `PENDING` and no useful error anywhere.
+> `PENDING` and no useful error anywhere. ECR, SQS, Secrets Manager, and the
+> S3 weights bucket are all reached from the **private** subnets where the
+> containers run.
+
+---
+
+## 0.5 Create the VPC and network prerequisites
+
+Skip this section if the account already has a suitable VPC.
+
+Everything here uses AWS CLI. Each command prints an ID — keep them, you will
+paste them into `testing.tfvars` later.
+
+### Set the region before you start
+
+```bash
+export AWS_REGION=us-east-1        # change if you want a different region
+export AWS_PROFILE=labs-testing    # your named profile, or omit to use the default
+export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+echo "Building network in account $ACCOUNT_ID / $AWS_REGION"
+```
+
+### Create the VPC
+
+```bash
+VPC_ID=$(aws ec2 create-vpc \
+  --cidr-block 10.0.0.0/16 \
+  --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=labs-vpc}]" \
+  --query Vpc.VpcId --output text)
+echo "VPC_ID=$VPC_ID"
+
+# Enable DNS so containers resolve endpoint hostnames.
+aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-support
+aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-hostnames
+```
+
+### Create two public subnets (one per AZ)
+
+These host the ALB and the NAT gateway. The ALB requires at least two AZs.
+
+```bash
+PUB_A=$(aws ec2 create-subnet \
+  --vpc-id $VPC_ID --cidr-block 10.0.0.0/24 \
+  --availability-zone ${AWS_REGION}a \
+  --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=labs-public-a}]" \
+  --query Subnet.SubnetId --output text)
+
+PUB_B=$(aws ec2 create-subnet \
+  --vpc-id $VPC_ID --cidr-block 10.0.1.0/24 \
+  --availability-zone ${AWS_REGION}b \
+  --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=labs-public-b}]" \
+  --query Subnet.SubnetId --output text)
+
+echo "PUB_A=$PUB_A  PUB_B=$PUB_B"
+```
+
+### Create two private subnets (one per AZ)
+
+These host every ECS task (API, screen, worker). They never have a direct
+route to the internet — outbound traffic goes through the NAT gateway.
+
+```bash
+PRIV_A=$(aws ec2 create-subnet \
+  --vpc-id $VPC_ID --cidr-block 10.0.10.0/24 \
+  --availability-zone ${AWS_REGION}a \
+  --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=labs-private-a}]" \
+  --query Subnet.SubnetId --output text)
+
+PRIV_B=$(aws ec2 create-subnet \
+  --vpc-id $VPC_ID --cidr-block 10.0.11.0/24 \
+  --availability-zone ${AWS_REGION}b \
+  --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=labs-private-b}]" \
+  --query Subnet.SubnetId --output text)
+
+echo "PRIV_A=$PRIV_A  PRIV_B=$PRIV_B"
+```
+
+### Internet gateway (for the public subnets and the NAT gateway)
+
+```bash
+IGW=$(aws ec2 create-internet-gateway \
+  --tag-specifications "ResourceType=internet-gateway,Tags=[{Key=Name,Value=labs-igw}]" \
+  --query InternetGateway.InternetGatewayId --output text)
+
+aws ec2 attach-internet-gateway --vpc-id $VPC_ID --internet-gateway-id $IGW
+echo "IGW=$IGW"
+```
+
+### Route the public subnets through the internet gateway
+
+```bash
+PUB_RT=$(aws ec2 create-route-table \
+  --vpc-id $VPC_ID \
+  --tag-specifications "ResourceType=route-table,Tags=[{Key=Name,Value=labs-public-rt}]" \
+  --query RouteTable.RouteTableId --output text)
+
+aws ec2 create-route --route-table-id $PUB_RT \
+  --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW
+
+aws ec2 associate-route-table --route-table-id $PUB_RT --subnet-id $PUB_A
+aws ec2 associate-route-table --route-table-id $PUB_RT --subnet-id $PUB_B
+```
+
+### Allocate an Elastic IP and create the NAT gateway
+
+The NAT gateway lives in one of the **public** subnets and gives the
+**private** subnets a route out. One NAT is sufficient for testing; for
+production use one per AZ so an AZ outage does not take down routing.
+
+```bash
+EIP=$(aws ec2 allocate-address --domain vpc \
+  --query AllocationId --output text)
+echo "EIP=$EIP"
+
+NAT=$(aws ec2 create-nat-gateway \
+  --subnet-id $PUB_A \
+  --allocation-id $EIP \
+  --tag-specifications "ResourceType=natgateway,Tags=[{Key=Name,Value=labs-nat}]" \
+  --query NatGateway.NatGatewayId --output text)
+echo "NAT=$NAT  (takes ~2 minutes to become available)"
+
+# Wait for the NAT gateway to be ready before creating the route.
+aws ec2 wait nat-gateway-available --nat-gateway-ids $NAT
+echo "NAT gateway is up."
+```
+
+### Route the private subnets through the NAT gateway
+
+```bash
+PRIV_RT=$(aws ec2 create-route-table \
+  --vpc-id $VPC_ID \
+  --tag-specifications "ResourceType=route-table,Tags=[{Key=Name,Value=labs-private-rt}]" \
+  --query RouteTable.RouteTableId --output text)
+
+aws ec2 create-route --route-table-id $PRIV_RT \
+  --destination-cidr-block 0.0.0.0/0 --nat-gateway-id $NAT
+
+aws ec2 associate-route-table --route-table-id $PRIV_RT --subnet-id $PRIV_A
+aws ec2 associate-route-table --route-table-id $PRIV_RT --subnet-id $PRIV_B
+```
+
+### Verify the NAT route before moving on
+
+This is the single most common deployment blocker. Confirm the private subnets
+have a route table entry pointing at the NAT:
+
+```bash
+aws ec2 describe-route-tables \
+  --filters "Name=route-table-id,Values=$PRIV_RT" \
+  --query 'RouteTables[0].Routes[*].{dest:DestinationCidrBlock,via:NatGatewayId}' \
+  --output table
+```
+
+You should see `0.0.0.0/0` pointing at the `nat-...` ID. If that row is
+missing, ECS tasks in the private subnets cannot reach ECR, S3, SQS or
+Secrets Manager — they will start and immediately hang.
+
+### Record the IDs you will need for testing.tfvars
+
+```bash
+echo "vpc_id              = \"$VPC_ID\""
+echo "private_subnet_ids  = [\"$PRIV_A\", \"$PRIV_B\"]"
+echo "public_subnet_ids   = [\"$PUB_A\", \"$PUB_B\"]"
+```
+
+Copy these three lines exactly as printed into `testing.tfvars` at step 6.
+
+### ACM certificate (optional — HTTP only if skipped)
+
+A certificate is needed for HTTPS on the ALB. If you do not have a domain,
+leave `certificate_arn = ""` in `testing.tfvars` and the ALB will serve HTTP
+only. **Never expose HTTP to the public internet in production.**
+
+If you have a domain, issue a certificate in the same region as the
+deployment. DNS validation is faster than email validation:
+
+```bash
+CERT_ARN=$(aws acm request-certificate \
+  --domain-name api.yourdomain.com \
+  --validation-method DNS \
+  --query CertificateArn --output text)
+echo "CERT_ARN=$CERT_ARN"
+
+# Print the CNAME record ACM needs you to create in your DNS.
+aws acm describe-certificate --certificate-arn $CERT_ARN \
+  --query 'Certificate.DomainValidationOptions[0].ResourceRecord'
+```
+
+Create that CNAME in your DNS provider (Cloudflare, Route 53, etc.), then wait
+for it to validate — typically 2–5 minutes with DNS propagated:
+
+```bash
+aws acm wait certificate-validated --certificate-arn $CERT_ARN
+echo "Certificate validated. ARN: $CERT_ARN"
+```
+
+Put the ARN in `testing.tfvars`:
+```hcl
+certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/..."
+```
+
+With a certificate, the ALB listens on 443 and redirects 80 → 443
+automatically. Without one, it listens on 80 only.
 
 ---
 
