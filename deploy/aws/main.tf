@@ -40,6 +40,28 @@ terraform {
   }
 }
 
+# Pinned to var.region explicitly.
+#
+# Without this block the provider falls back to AWS_REGION / AWS_PROFILE, and
+# `var.region` becomes decorative: a tfvars saying eu-west-1 would deploy to
+# whatever the shell happened to export, with no error anywhere. The failure is
+# silent and expensive - a full stack in the wrong region, billed, while the
+# state file insists it is where you asked for.
+#
+# default_tags land on every taggable resource, which is what makes "what does
+# LABS cost in this account" answerable in Cost Explorer without tagging each
+# resource by hand.
+provider "aws" {
+  region = var.region
+
+  default_tags {
+    tags = {
+      Project   = var.name
+      ManagedBy = "terraform"
+    }
+  }
+}
+
 variable "name" { default = "labs" }
 variable "region" { default = "us-east-1" }
 variable "vpc_id" { type = string }

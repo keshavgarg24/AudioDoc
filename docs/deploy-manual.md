@@ -1,663 +1,298 @@
-# Manual deployment to AWS
+# Deploying LABS to AWS
 
-Every step is run by hand from a laptop. Nothing in this document is triggered
-by a git push, a webhook or a CI job — there is no pipeline, by design, so a
-testing account can be brought up and torn down without touching the
-production repository.
+From a fresh clone and an empty AWS account to a working API.
 
-Budget about **90 minutes** the first time, most of it waiting for image
-pushes and the MongoDB cluster.
+Nothing here is triggered by a git push, a webhook or a CI job. There is no
+pipeline, by design, so a testing account can be brought up and torn down
+without the production repository being involved at all.
 
-- [0. What you need first](#0-what-you-need-first)
-- [0.5 Create the VPC and network prerequisites](#05-create-the-vpc-and-network-prerequisites)
-- [1. Account and region](#1-account-and-region)
-- [2. MongoDB](#2-mongodb)
-- [3. Secrets](#3-secrets)
-- [4. Mirror the checkpoints to S3](#4-mirror-the-checkpoints-to-s3)
-- [5. Build and push the images](#5-build-and-push-the-images)
-- [6. Terraform](#6-terraform)
-- [7. Create an API key](#7-create-an-api-key)
-- [8. Smoke test](#8-smoke-test)
-- [9. Watching it work](#9-watching-it-work)
-- [10. Updating a deployment](#10-updating-a-deployment)
-- [11. Tearing it down](#11-tearing-it-down)
+- [What you actually have to do](#what-you-actually-have-to-do)
+- [Before you start](#before-you-start)
+- [The one-command deploy](#the-one-command-deploy)
+- [What each stage does](#what-each-stage-does)
+- [Configuration](#configuration)
+- [After it is up](#after-it-is-up)
+- [Updating](#updating)
+- [Tearing it down](#tearing-it-down)
 - [Troubleshooting](#troubleshooting)
+- [Doing it by hand](#doing-it-by-hand)
 
 ---
 
-## 0. What you need first
+## What you actually have to do
 
-On the laptop:
+Three things need a human. Everything else is automated.
 
-```bash
-aws --version          # v2.x
-docker --version       # must be running, with buildx
-terraform version      # >= 1.5
-```
+| # | You do this | Why it cannot be automated |
+|---|---|---|
+| 1 | Install four CLI tools | One-off, on your laptop |
+| 2 | Create a MongoDB cluster and copy its URI | An account on a third-party service |
+| 3 | Run `./deploy.sh` | — |
 
-Terraform is not in homebrew-core any more — it moved to HashiCorp's own tap
-when the licence changed:
+Then one thing after the network exists:
 
-```bash
-brew install hashicorp/tap/terraform
-```
+| 4 | Paste the NAT gateway IP into MongoDB Atlas → Network Access | Atlas has to be told which IP may connect, and that IP does not exist until the NAT is created |
 
-The Terraform deliberately does not create the VPC, subnets, NAT or
-certificate — those belong to the account, not to one service. If your testing
-account already has a VPC with private subnets and a NAT gateway, skip to
-[section 1](#1-account-and-region) and just collect the IDs. If starting from a
-blank account, section 0.5 builds everything from scratch in about ten minutes.
+That is the whole list.
 
-> **Check the NAT before anything else.** A private subnet with no route out is
-> the single most common reason a first deploy hangs with tasks stuck in
-> `PENDING` and no useful error anywhere. ECR, SQS, Secrets Manager, and the
-> S3 weights bucket are all reached from the **private** subnets where the
-> containers run.
+> **The checkpoints are not in this repository, and cannot be.** Stage-1 is
+> 1.2 GB and GitHub rejects files over 100 MB. A fresh clone gives you all the
+> code and the Level-1 ONNX weights (1.2 MB, committed as package data) but
+> nothing for the deep tier. `03-weights.sh` handles this: it uses
+> `checkpoints/` if you have it, and otherwise downloads from Hugging Face
+> once and mirrors into your own S3 bucket. After the first run the origin
+> stops mattering.
 
 ---
 
-## 0.5 Create the VPC and network prerequisites
-
-Skip this section if the account already has a suitable VPC.
-
-Everything here uses AWS CLI. Each command prints an ID — keep them, you will
-paste them into `testing.tfvars` later.
-
-### Set the region before you start
+## Before you start
 
 ```bash
-export AWS_REGION=us-east-1        # change if you want a different region
-export AWS_PROFILE=labs-testing    # your named profile, or omit to use the default
-export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-echo "Building network in account $ACCOUNT_ID / $AWS_REGION"
+brew install awscli hashicorp/tap/terraform python
+# Docker Desktop: https://docker.com/products/docker-desktop — install and start it
 ```
 
-### Create the VPC
+Terraform is not in homebrew-core any more; it moved to HashiCorp's own tap
+when the licence changed.
+
+Configure AWS credentials for the account you are deploying into:
 
 ```bash
-VPC_ID=$(aws ec2 create-vpc \
-  --cidr-block 10.0.0.0/16 \
-  --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=labs-vpc}]" \
-  --query Vpc.VpcId --output text)
-echo "VPC_ID=$VPC_ID"
-
-# Enable DNS so containers resolve endpoint hostnames.
-aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-support
-aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-hostnames
+aws configure
+aws sts get-caller-identity      # confirm this is the TESTING account
 ```
 
-### Create two public subnets (one per AZ)
+Create a MongoDB cluster at [cloud.mongodb.com](https://cloud.mongodb.com).
+M0 is free and fine for testing; M10 (~$60/month) is the smallest worth using
+with more than one container. Add a database user with `readWrite` on the
+`labs` database and copy the SRV connection string.
 
-These host the ALB and the NAT gateway. The ALB requires at least two AZs.
-
-```bash
-PUB_A=$(aws ec2 create-subnet \
-  --vpc-id $VPC_ID --cidr-block 10.0.0.0/24 \
-  --availability-zone ${AWS_REGION}a \
-  --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=labs-public-a}]" \
-  --query Subnet.SubnetId --output text)
-
-PUB_B=$(aws ec2 create-subnet \
-  --vpc-id $VPC_ID --cidr-block 10.0.1.0/24 \
-  --availability-zone ${AWS_REGION}b \
-  --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=labs-public-b}]" \
-  --query Subnet.SubnetId --output text)
-
-echo "PUB_A=$PUB_A  PUB_B=$PUB_B"
-```
-
-### Create two private subnets (one per AZ)
-
-These host every ECS task (API, screen, worker). They never have a direct
-route to the internet — outbound traffic goes through the NAT gateway.
-
-```bash
-PRIV_A=$(aws ec2 create-subnet \
-  --vpc-id $VPC_ID --cidr-block 10.0.10.0/24 \
-  --availability-zone ${AWS_REGION}a \
-  --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=labs-private-a}]" \
-  --query Subnet.SubnetId --output text)
-
-PRIV_B=$(aws ec2 create-subnet \
-  --vpc-id $VPC_ID --cidr-block 10.0.11.0/24 \
-  --availability-zone ${AWS_REGION}b \
-  --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=labs-private-b}]" \
-  --query Subnet.SubnetId --output text)
-
-echo "PRIV_A=$PRIV_A  PRIV_B=$PRIV_B"
-```
-
-### Internet gateway (for the public subnets and the NAT gateway)
-
-```bash
-IGW=$(aws ec2 create-internet-gateway \
-  --tag-specifications "ResourceType=internet-gateway,Tags=[{Key=Name,Value=labs-igw}]" \
-  --query InternetGateway.InternetGatewayId --output text)
-
-aws ec2 attach-internet-gateway --vpc-id $VPC_ID --internet-gateway-id $IGW
-echo "IGW=$IGW"
-```
-
-### Route the public subnets through the internet gateway
-
-```bash
-PUB_RT=$(aws ec2 create-route-table \
-  --vpc-id $VPC_ID \
-  --tag-specifications "ResourceType=route-table,Tags=[{Key=Name,Value=labs-public-rt}]" \
-  --query RouteTable.RouteTableId --output text)
-
-aws ec2 create-route --route-table-id $PUB_RT \
-  --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW
-
-aws ec2 associate-route-table --route-table-id $PUB_RT --subnet-id $PUB_A
-aws ec2 associate-route-table --route-table-id $PUB_RT --subnet-id $PUB_B
-```
-
-### Allocate an Elastic IP and create the NAT gateway
-
-The NAT gateway lives in one of the **public** subnets and gives the
-**private** subnets a route out. One NAT is sufficient for testing; for
-production use one per AZ so an AZ outage does not take down routing.
-
-```bash
-EIP=$(aws ec2 allocate-address --domain vpc \
-  --query AllocationId --output text)
-echo "EIP=$EIP"
-
-NAT=$(aws ec2 create-nat-gateway \
-  --subnet-id $PUB_A \
-  --allocation-id $EIP \
-  --tag-specifications "ResourceType=natgateway,Tags=[{Key=Name,Value=labs-nat}]" \
-  --query NatGateway.NatGatewayId --output text)
-echo "NAT=$NAT  (takes ~2 minutes to become available)"
-
-# Wait for the NAT gateway to be ready before creating the route.
-aws ec2 wait nat-gateway-available --nat-gateway-ids $NAT
-echo "NAT gateway is up."
-```
-
-### Route the private subnets through the NAT gateway
-
-```bash
-PRIV_RT=$(aws ec2 create-route-table \
-  --vpc-id $VPC_ID \
-  --tag-specifications "ResourceType=route-table,Tags=[{Key=Name,Value=labs-private-rt}]" \
-  --query RouteTable.RouteTableId --output text)
-
-aws ec2 create-route --route-table-id $PRIV_RT \
-  --destination-cidr-block 0.0.0.0/0 --nat-gateway-id $NAT
-
-aws ec2 associate-route-table --route-table-id $PRIV_RT --subnet-id $PRIV_A
-aws ec2 associate-route-table --route-table-id $PRIV_RT --subnet-id $PRIV_B
-```
-
-### Verify the NAT route before moving on
-
-This is the single most common deployment blocker. Confirm the private subnets
-have a route table entry pointing at the NAT:
-
-```bash
-aws ec2 describe-route-tables \
-  --filters "Name=route-table-id,Values=$PRIV_RT" \
-  --query 'RouteTables[0].Routes[*].{dest:DestinationCidrBlock,via:NatGatewayId}' \
-  --output table
-```
-
-You should see `0.0.0.0/0` pointing at the `nat-...` ID. If that row is
-missing, ECS tasks in the private subnets cannot reach ECR, S3, SQS or
-Secrets Manager — they will start and immediately hang.
-
-### Record the IDs you will need for testing.tfvars
-
-```bash
-echo "vpc_id              = \"$VPC_ID\""
-echo "private_subnet_ids  = [\"$PRIV_A\", \"$PRIV_B\"]"
-echo "public_subnet_ids   = [\"$PUB_A\", \"$PUB_B\"]"
-```
-
-Copy these three lines exactly as printed into `testing.tfvars` at step 6.
-
-### ACM certificate (optional — HTTP only if skipped)
-
-A certificate is needed for HTTPS on the ALB. If you do not have a domain,
-leave `certificate_arn = ""` in `testing.tfvars` and the ALB will serve HTTP
-only. **Never expose HTTP to the public internet in production.**
-
-If you have a domain, issue a certificate in the same region as the
-deployment. DNS validation is faster than email validation:
-
-```bash
-CERT_ARN=$(aws acm request-certificate \
-  --domain-name api.yourdomain.com \
-  --validation-method DNS \
-  --query CertificateArn --output text)
-echo "CERT_ARN=$CERT_ARN"
-
-# Print the CNAME record ACM needs you to create in your DNS.
-aws acm describe-certificate --certificate-arn $CERT_ARN \
-  --query 'Certificate.DomainValidationOptions[0].ResourceRecord'
-```
-
-Create that CNAME in your DNS provider (Cloudflare, Route 53, etc.), then wait
-for it to validate — typically 2–5 minutes with DNS propagated:
-
-```bash
-aws acm wait certificate-validated --certificate-arn $CERT_ARN
-echo "Certificate validated. ARN: $CERT_ARN"
-```
-
-Put the ARN in `testing.tfvars`:
-```hcl
-certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/..."
-```
-
-With a certificate, the ALB listens on 443 and redirects 80 → 443
-automatically. Without one, it listens on 80 only.
+MongoDB is not optional. It carries job state, every stored report, and the
+SHA-256 index that makes deduplication work. Without it the service runs in
+memory: a job accepted by one container is invisible to every other one, and
+identical audio is re-analysed at full cost every time.
 
 ---
 
-## 1. Account and region
-
-```bash
-export AWS_PROFILE=labs-testing
-export AWS_REGION=us-east-1
-export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-echo "Deploying into $ACCOUNT_ID / $AWS_REGION"
-```
-
-Confirm that account id is the **testing** account before continuing. Every
-remaining step writes into whatever this prints.
-
----
-
-## 2. MongoDB
-
-MongoDB carries job state and every stored report. Without it the service runs
-in memory, deduplication stops, and a job accepted by one container is
-invisible to every other one.
-
-Atlas M10 (~$60/month) is the smallest size worth using in a deployment with
-more than one container.
-
-1. Create a cluster in **the same region** as the deployment.
-2. Network access: allow the VPC's NAT gateway public IP, or set up VPC
-   peering. Do not use `0.0.0.0/0`.
-3. Create a database user with `readWrite` on the `labs` database.
-4. Copy the SRV connection string:
-   `mongodb+srv://USER:PASS@cluster.xxxxx.mongodb.net/labs`
-
-Keep it on the clipboard for the next step and **do not** paste it into a
-`.tfvars` file.
-
----
-
-## 3. Secrets
-
-Nothing secret is ever passed to Terraform as a value. A Terraform variable
-holding a password is written to state in plaintext, and state is readable by
-anyone who can run `plan`. Terraform only ever sees **ARNs**; the ECS agent
-resolves them at container start.
-
-```bash
-# Required.
-MONGO_ARN=$(aws secretsmanager create-secret \
-  --name labs/mongo-uri \
-  --secret-string 'mongodb+srv://USER:PASS@cluster.xxxxx.mongodb.net/labs' \
-  --query ARN --output text)
-
-# Signs webhook callbacks so a receiver can verify they came from you.
-WEBHOOK_ARN=$(aws secretsmanager create-secret \
-  --name labs/webhook-secret \
-  --secret-string "$(openssl rand -hex 32)" \
-  --query ARN --output text)
-
-echo "MONGO_ARN=$MONGO_ARN"
-echo "WEBHOOK_ARN=$WEBHOOK_ARN"
-```
-
-Optional — ACRCloud catalogue verification. Skip both if you are not using it;
-the service runs without them.
-
-The app uses ACRCloud's **File Scanning API** (Bearer auth), not the
-Fingerprinting API (HMAC). Get the Bearer token and container ID from your
-ACRCloud dashboard → File Scanning → the container you created.
-
-```bash
-ACR_TOKEN_ARN=$(aws secretsmanager create-secret \
-  --name labs/acr-bearer-token --secret-string 'eyJ...' --query ARN --output text)
-ACR_CID_ARN=$(aws secretsmanager create-secret \
-  --name labs/acr-container-id --secret-string 'your-container-id' --query ARN --output text)
-echo "ACR_TOKEN_ARN=$ACR_TOKEN_ARN"
-echo "ACR_CID_ARN=$ACR_CID_ARN"
-```
-
----
-
-## 4. Mirror the checkpoints to S3
-
-`LABS_OFFLINE=true` in production, so a worker **will not** download 1.3 GB
-from a third-party mirror during a deploy. It fails loudly instead. Mirroring
-is also what makes a deploy reproducible: an upstream can change or vanish,
-your bucket cannot.
-
-```bash
-export WEIGHTS_BUCKET=labs-weights-$ACCOUNT_ID
-
-aws s3 mb s3://$WEIGHTS_BUCKET
-aws s3api put-public-access-block --bucket $WEIGHTS_BUCKET \
-  --public-access-block-configuration \
-  BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
-
-# ~1.3 GB. Takes a few minutes.
-aws s3 cp checkpoints/Stage-1.ckpt s3://$WEIGHTS_BUCKET/models/checkpoints/Stage-1.ckpt
-aws s3 cp checkpoints/Stage-2.ckpt s3://$WEIGHTS_BUCKET/models/checkpoints/Stage-2.ckpt
-
-export WEIGHTS_URI=s3://$WEIGHTS_BUCKET/models
-```
-
-### Record the digests
-
-A revision pins *what you asked for*. A digest pins *what you got* — and they
-catch different failures. A revision cannot detect a truncated upload, a stale
-file on a reused volume, or a bucket somebody else can write to. The failure
-being defended against is not a crash; it is **a different model answering
-confidently in your name**.
-
-```bash
-shasum -a 256 checkpoints/Stage-1.ckpt checkpoints/Stage-2.ckpt
-```
-
-Keep both hex strings. They become `LABS_STAGE1_SHA256` and
-`LABS_STAGE2_SHA256`, and a mismatch then refuses to start rather than serving
-verdicts from an unknown model.
-
----
-
-## 5. Build and push the images
-
-Three targets are built from one Dockerfile. They are genuinely different
-images, not tags of the same one:
-
-| Target | Size | Contains | Used by |
-|---|---|---|---|
-| `screen` | ~350 MB | numpy, scipy, librosa, ONNX Runtime | screen fleet **and** api fleet |
-| `worker` | ~2.5 GB | the above plus torch, transformers, lightning | worker fleet |
-| `api` | ~2.5 GB | full stack, single-container mode | not used in this topology |
-
-The api fleet deliberately runs the **screen** image. It validates, stores and
-enqueues; it never analyses, so shipping torch to it would be 2.1 GB of cold
-start for code that never executes.
-
-```bash
-aws ecr create-repository --repository-name labs-screen || true
-aws ecr create-repository --repository-name labs-worker || true
-
-ECR=$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
-aws ecr get-login-password | docker login --username AWS --password-stdin $ECR
-```
-
-**Build for ARM64.** The Terraform specifies Graviton instances and ARM
-Fargate; an x86 image on them fails with a cryptic `exec format error`.
-
-```bash
-docker buildx build --platform linux/arm64 --target screen \
-  -t $ECR/labs-screen:v1 --push .
-
-docker buildx build --platform linux/arm64 --target worker \
-  -t $ECR/labs-worker:v1 --push .
-```
-
-Verify both landed:
-
-```bash
-aws ecr describe-images --repository-name labs-screen \
-  --query 'imageDetails[].imageTags' --output text
-```
-
-> Use a real tag like `v1`, not `latest`. `latest` makes "which image is
-> actually running" unanswerable during an incident, and makes a rollback a
-> guess.
-
----
-
-## 6. Terraform
+## The one-command deploy
 
 ```bash
 cd deploy/aws
-terraform init
-terraform validate      # must print: Success! The configuration is valid.
+MONGO_URI='mongodb+srv://USER:PASS@cluster.xxxxx.mongodb.net/labs' ./deploy.sh
 ```
 
-Write `testing.tfvars` — **gitignored**, because this is where account ids and
-subnet ids accumulate:
+It prints the account it is about to deploy into and waits for confirmation,
+then runs every stage in order. Budget **25–40 minutes**, most of it the
+worker image push (2.5 GB) and the ALB coming up.
 
-```hcl
-name       = "labs-test"
-region     = "us-east-1"
-vpc_id     = "vpc-0abc123"
+Part way through, stage 1 prints something like:
 
-private_subnet_ids = ["subnet-0aaa", "subnet-0bbb"]
-public_subnet_ids  = ["subnet-0ccc", "subnet-0ddd"]
-
-image_tag      = "v1"
-weights_s3_uri = "s3://labs-weights-123456789012/models"
-
-mongo_uri_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:labs/mongo-uri-AbCdEf"
-webhook_secret_arn   = "arn:aws:secretsmanager:us-east-1:123456789012:secret:labs/webhook-secret-GhIjKl"
-
-# ACRCloud File Scanning — omit both to run without catalogue verification.
-# acr_bearer_token_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:labs/acr-bearer-token-XxXxXx"
-# acr_container_id_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:labs/acr-container-id-YyYyYy"
-
-# Testing: keep it small and cheap.
-worker_instance_type = "c7g.xlarge"
-worker_max_size      = 4
-warm_pool_size       = 0     # save ~$10/mo; accept a 3-5 min cold start
-burst_to_fargate     = false
-
-# Retention: 0 everywhere means keep forever, which is the default.
-audio_ttl_days        = 0
-result_ttl_days       = 0
-screen_retain_seconds = 0
-
-# No ACM certificate in testing, so HTTP only. Never do this with a
-# public-facing listener.
-certificate_arn = ""
+```
+    NAT public IP: 54.87.x.x
+    Allowlist that IP in MongoDB Atlas -> Network Access.
 ```
 
-Read the plan before applying. This is the step where a wrong subnet or a
-wrong account shows up:
+Do that in the Atlas console while the build runs. Every container reaches
+Mongo through the NAT, so that one IP is the only address Atlas ever sees —
+there is no need for `0.0.0.0/0`, and you should not use it.
+
+At the end you get the URL and an API key:
+
+```
+    API    http://labs-test-alb-123456.us-east-1.elb.amazonaws.com
+    KEY    sk-xxxxxxxxxxxxxxxxxxxx
+```
+
+**Save the key.** It is stored only as a SHA-256 hash and cannot be recovered.
+
+### If a stage fails
+
+Fix the cause and run `./deploy.sh` again. **Every stage is idempotent** — it
+looks for what it would create before creating it, so a re-run skips what
+already exists rather than making a second copy. You can also run a single
+stage directly:
 
 ```bash
-terraform plan -var-file=testing.tfvars -out=tfplan
-terraform show tfplan | head -60
-terraform apply tfplan
-```
-
-Roughly 8–12 minutes. The ALB and the ASG are the slow parts.
-
-```bash
-export ALB=$(terraform output -raw alb_dns_name)
-echo "http://$ALB"
+./04-images.sh        # just rebuild and push the images
 ```
 
 ---
 
-## 7. Create an API key
+## What each stage does
 
-`LABS_REQUIRE_AUTH=true` in production, so every call needs a key. Keys live in
-MongoDB, which means creating one requires the database rather than a redeploy
-— and it also means a key can be revoked without one.
+| Script | Creates | Notes |
+|---|---|---|
+| `01-network.sh` | VPC, 2 public + 2 private subnets, IGW, NAT gateway, route tables | Two AZs is required — an ALB refuses to be created with one. Asserts the private `0.0.0.0/0` → NAT route before exiting. |
+| `02-secrets.sh` | Mongo URI and a generated webhook signing secret in Secrets Manager | Writes **ARNs only** into tfvars. No secret value ever reaches Terraform. |
+| `03-weights.sh` | Weights bucket, uploads both checkpoints, pins SHA-256 digests | Downloads from Hugging Face if `checkpoints/` is empty. |
+| `04-images.sh` | ECR repositories, builds and pushes both images for ARM64 | Verifies the pushed architecture from the registry afterwards. |
+| `05-apply.sh` | Everything else, via Terraform | ALB, ECS cluster, Fargate services, worker ASG, SQS + DLQ, audio bucket, IAM. |
+| `06-verify.sh` | An API key, then a graduated smoke test | Liveness → readiness → Level 1 → Level 2 → DLQ check. |
+
+Each script writes its outputs into a `*.auto.tfvars` file. Terraform loads
+those automatically, so there is no `-var-file` to remember and no way to
+apply against a stale one by accident. They are gitignored — they hold your
+account's real subnet ids and secret ARNs.
+
+### Why the smoke test goes in that order
+
+Liveness needs no model. Readiness needs the backbone. Level 1 needs the ONNX
+weights, which ship inside the image. Level 2 needs the checkpoints in S3
+*and* the queue *and* a worker *and* MongoDB. Testing in that order means the
+first failure tells you which layer broke, instead of just "it does not work".
+
+---
+
+## Configuration
+
+Defaults are tuned for a testing stack at low volume. Override with
+environment variables:
 
 ```bash
-docker run --rm \
-  -e LABS_MONGO_URI='mongodb+srv://USER:PASS@cluster.xxxxx.mongodb.net/labs' \
-  $ECR/labs-worker:v1 \
-  python -m labs.cli.manage_keys create \
-    --name "testing" --scopes screen,analyze,deep,read
+STACK_NAME=labs-prod \
+AWS_REGION=eu-west-1 \
+WORKER_INSTANCE_TYPE=c7g.2xlarge \
+WARM_POOL_SIZE=2 \
+MONGO_URI='mongodb+srv://...' \
+./deploy.sh
 ```
 
-It prints the key **once**. It is stored only as a hash, so there is no way to
-recover it later — losing it means issuing a new one.
-
-Scopes, and what each actually buys:
-
-| Scope | Grants | Cost shape |
+| Variable | Default | What it controls |
 |---|---|---|
-| `screen` | `POST /v1/screen` | free, ~1.5 s, anonymous holds this by default |
+| `STACK_NAME` | `labs-test` | Namespaces everything. Two stacks can share an account. |
+| `AWS_REGION` | `us-east-1` | |
+| `IMAGE_TAG` | `v1` | Never use `latest` — see below. |
+| `WORKER_INSTANCE_TYPE` | `c7g.xlarge` | `c7g.2xlarge` for production. |
+| `WORKER_MAX_SIZE` | `4` | Ceiling on the worker ASG. |
+| `WARM_POOL_SIZE` | `1` | Stopped instances kept ready. |
+| `WORKER_BASE_TASKS` | `0` | Always-running workers. |
+| `BURST_TO_FARGATE` | `false` | Overflow to Fargate when the ASG is saturated. |
+| `CERTIFICATE_ARN` | *(empty)* | ACM cert for HTTPS. Empty means HTTP only. |
+| `DEPLOY_AUTO_APPROVE` | *(unset)* | `1` skips every prompt. |
+
+### On `warm_pool_size` and `worker_base_tasks`
+
+`WARM_POOL_SIZE=1, WORKER_BASE_TASKS=0` is the default and is the right
+answer at low volume.
+
+A warm-pool instance is **stopped**: it bills only for its EBS volume (~$3 a
+month) but resumes in about 30 seconds, because the image is already pulled
+and the weights are already on the volume. A cold launch is 3–5 minutes.
+
+`WORKER_BASE_TASKS=1` keeps a `c7g.2xlarge` running permanently — about $212
+a month. At 50 analyses a day that instance is 99.96% idle. Use it only when
+a caller genuinely cannot wait 30 seconds for the first request after a quiet
+period.
+
+### On image tags
+
+Use a real tag. `latest` makes "which image is actually running" unanswerable
+during an incident, and turns a rollback into a guess.
+
+### On HTTPS
+
+Without `CERTIFICATE_ARN` the ALB serves **HTTP only**. That is acceptable for
+a testing stack inside a VPC you control. Never expose it publicly.
+
+To enable TLS, request a certificate in the same region, create the CNAME it
+asks for in your DNS, then:
+
+```bash
+CERT_ARN=$(aws acm request-certificate --domain-name api.yourdomain.com \
+  --validation-method DNS --query CertificateArn --output text)
+
+aws acm describe-certificate --certificate-arn $CERT_ARN \
+  --query 'Certificate.DomainValidationOptions[0].ResourceRecord'
+# create that CNAME in your DNS, then:
+aws acm wait certificate-validated --certificate-arn $CERT_ARN
+
+CERTIFICATE_ARN=$CERT_ARN ./05-apply.sh
+```
+
+With a certificate the ALB listens on 443 and redirects 80 → 443.
+
+---
+
+## After it is up
+
+```bash
+cd deploy/aws
+
+# Logs
+aws logs tail $(terraform output -raw log_group) --follow
+
+# Backlog. A large number with NotVisible=0 means nothing is consuming it.
+aws sqs get-queue-attributes --queue-url $(terraform output -raw queue_url) \
+  --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible
+
+# Anything here failed three times, so it fails deterministically.
+aws sqs get-queue-attributes --queue-url $(terraform output -raw dlq_url) \
+  --attribute-names ApproximateNumberOfMessages
+
+# Did autoscaling fire?
+aws autoscaling describe-scaling-activities \
+  --auto-scaling-group-name $(terraform output -raw worker_asg_name) --max-items 10
+```
+
+### Issuing more API keys
+
+```bash
+docker run --rm -e LABS_MONGO_URI="$MONGO_URI" \
+  $(aws sts get-caller-identity --query Account --output text).dkr.ecr.$AWS_REGION.amazonaws.com/labs-test-worker:v1 \
+  python -m labs.cli.manage_keys create --name "frontend" --scopes screen,read
+```
+
+| Scope | Grants | Cost |
+|---|---|---|
+| `screen` | `POST /v1/screen` | free, ~1.5 s |
 | `analyze` | `POST /v1/analyses` with `mode=audio` | DSP only, no backbone |
 | `deep` | `mode=ai` / `mode=full`, and appeals | loads the 1.29 GB backbone |
 | `read` | polling results | — |
 
-`analyze` deliberately does **not** imply `deep`. `mode=audio` runs the DSP and
-musicological passes and never touches Stage-1 or Stage-2, so gating it behind
-`deep` would charge for a tier it does not use.
+`analyze` deliberately does **not** imply `deep`. `mode=audio` never touches
+Stage-1 or Stage-2, so gating it behind `deep` would charge for a tier it does
+not use.
 
 ---
 
-## 8. Smoke test
-
-Work up from the cheapest thing that can fail.
-
-**Liveness** — no auth, answers before any model is loaded:
+## Updating
 
 ```bash
-curl -s http://$ALB/health
-```
-
-**Readiness** — reports whether the backbone actually loaded:
-
-```bash
-curl -s http://$ALB/v1/ready | python3 -m json.tool
-```
-
-**Level 1**, synchronous, answers in the response:
-
-```bash
-curl -s -X POST http://$ALB/v1/screen \
-  -H "X-API-Key: $LABS_KEY" \
-  -F file=@audio/ai1.mp3 | python3 -m json.tool
-```
-
-Expect `verdict`, `next_step`, and `elapsed_s` around 1–3 s.
-
-**Level 2**, asynchronous — returns a job id immediately:
-
-```bash
-JOB=$(curl -s -X POST http://$ALB/v1/analyses \
-  -H "X-API-Key: $LABS_KEY" \
-  -F file=@audio/1.mp3 -F mode=full | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
-
-# Poll. 40-90 s on a warm worker; several minutes on a cold one.
-watch -n 5 "curl -s http://$ALB/v1/analyses/$JOB \
-  -H 'X-API-Key: $LABS_KEY' | python3 -c \
-  'import sys,json;d=json.load(sys.stdin);print(d[\"status\"], d.get(\"progress\"))'"
-```
-
-**Deduplication** — submit the same file twice. The second returns the stored
-result rather than re-running 60 s of CPU, matched on SHA-256 of the bytes:
-
-```bash
-curl -s -X POST http://$ALB/v1/analyses -H "X-API-Key: $LABS_KEY" \
-  -F file=@audio/1.mp3 -F mode=full | python3 -m json.tool
-```
-
-**A tool**:
-
-```bash
-curl -s -X POST http://$ALB/v1/tools/tempo-lab \
-  -H "X-API-Key: $LABS_KEY" -F file=@audio/1.mp3 | python3 -m json.tool
-```
-
----
-
-## 9. Watching it work
-
-**Is anything queued, and is anyone consuming it?**
-
-```bash
-aws sqs get-queue-attributes \
-  --queue-url $(terraform output -raw queue_url) \
-  --attribute-names ApproximateNumberOfMessages \
-                    ApproximateNumberOfMessagesNotVisible
-```
-
-`Messages` is the backlog. `NotVisible` is what workers are holding right now.
-A large backlog with `NotVisible = 0` means **nothing is consuming** — check
-the worker service before anything else.
-
-**The dead-letter queue should be empty.** Anything in it failed three times,
-which means it failed deterministically:
-
-```bash
-aws sqs get-queue-attributes \
-  --queue-url $(terraform output -raw dlq_url) \
-  --attribute-names ApproximateNumberOfMessages
-```
-
-**Logs:**
-
-```bash
-aws logs tail /ecs/labs-test --follow --since 10m
-aws logs tail /ecs/labs-test --follow --filter-pattern "ERROR"
-```
-
-**Did the autoscaling fire?**
-
-```bash
-aws autoscaling describe-scaling-activities \
-  --auto-scaling-group-name labs-test-worker --max-items 10
-```
-
----
-
-## 10. Updating a deployment
-
-Build a new tag, then roll it. Never overwrite a tag that is running — that
-makes a rollback a guess.
-
-```bash
-docker buildx build --platform linux/arm64 --target worker \
-  -t $ECR/labs-worker:v2 --push .
-
-terraform apply -var-file=testing.tfvars -var image_tag=v2
+IMAGE_TAG=v2 ./04-images.sh
+IMAGE_TAG=v2 ./05-apply.sh
 ```
 
 ECS replaces tasks one at a time behind the load balancer, and the worker
 drains in-flight analyses before stopping (`ECS_CONTAINER_STOP_TIMEOUT=3m`),
-so a deploy does not discard work a caller was told had been accepted.
+so a deploy does not discard work a caller was already told had been accepted.
 
 Rollback is the same command with the old tag:
 
 ```bash
-terraform apply -var-file=testing.tfvars -var image_tag=v1
+IMAGE_TAG=v1 ./05-apply.sh
 ```
 
 ---
 
-## 11. Tearing it down
+## Tearing it down
 
 ```bash
-terraform destroy -var-file=testing.tfvars
+./99-destroy.sh
 ```
 
-S3 buckets with objects in them will block the destroy. That is deliberate —
-it is the last guard against deleting the corpus:
+Deliberately not a single `terraform destroy`. Three things Terraform does not
+own have to be handled separately, and one of them bills whether you use it or
+not:
 
-```bash
-aws s3 rm s3://labs-test-audio-$ACCOUNT_ID --recursive
-aws s3 rm s3://$WEIGHTS_BUCKET --recursive
-```
+- **The NAT gateway, ~$32/month.** It survives `terraform destroy` because
+  Terraform never created it.
+- The ECR repositories and the secrets.
+- The audio bucket, which blocks the destroy while it has objects in it. That
+  is deliberate: it holds every track ever analysed, and emptying it is not
+  reversible. The script asks separately.
 
-Not managed by Terraform, so delete by hand if you are finished with them:
-
-```bash
-aws secretsmanager delete-secret --secret-id labs/mongo-uri --force-delete-without-recovery
-aws ecr delete-repository --repository-name labs-screen --force
-aws ecr delete-repository --repository-name labs-worker --force
-```
-
-And delete the Atlas cluster in the Atlas console.
+The weights bucket is left in place on purpose — about $0.03/month, and it
+saves re-uploading 1.3 GB next time.
 
 ---
 
@@ -665,26 +300,49 @@ And delete the Atlas cluster in the Atlas console.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Tasks stay `PENDING` forever | No route to ECR from the private subnet | NAT gateway, or VPC endpoints for ECR + S3 |
-| `exec format error` | x86 image on Graviton | Rebuild with `--platform linux/arm64` |
-| `/v1/ready` says not ready, logs show missing checkpoint | `weights_s3_uri` wrong, or the prefix does not contain `checkpoints/` | `aws s3 ls $WEIGHTS_URI/checkpoints/` |
-| Worker starts then exits | `AccessDenied` on the weights bucket | Check the worker role has `s3:GetObject` + `s3:ListBucket` on it |
-| `503 model_loading` on `/v1/analyses` | Backbone still loading (~12 s) | Wait, or set `LABS_EAGER_LOAD=true` |
-| Every analysis re-runs for identical audio | MongoDB unreachable | Logs say so at startup; check Atlas network access |
-| Jobs accepted, never finish | Nothing consuming the queue | Check `NotVisible`; check the worker service has running tasks |
-| Messages in the DLQ | A file breaks the pipeline deterministically | Pull one and run it locally: `python -m labs analyse <file> --mode full` |
+| Tasks stay `PENDING` forever | No route out of the private subnets | `./01-network.sh` asserts this. Re-run it. |
+| `exec format error` | x86 image on Graviton | `./04-images.sh` — it builds ARM64 and verifies the pushed architecture |
+| `ImagePullBackOff`, repository not found | ECR repo name does not match `${STACK_NAME}-screen` | Use the same `STACK_NAME` for `04-images.sh` and `05-apply.sh` |
+| `/v1/ready` not ready, logs show a missing checkpoint | Weights never reached S3 | `aws s3 ls $(terraform output -raw ... )`, or re-run `./03-weights.sh` |
+| Worker starts then exits, `AccessDenied` | Worker role cannot read the weights bucket | Check `weights_s3_uri` in `weights.auto.tfvars` points at your bucket |
+| `503 model_loading` | Backbone still loading (~12 s) | Wait, or set `LABS_EAGER_LOAD=true` |
+| Identical audio re-analysed every time | MongoDB unreachable | Atlas → Network Access must allowlist the NAT IP |
+| Jobs accepted, never finish | Nothing consuming the queue | Check `NotVisible`; check the worker ASG has instances |
+| Messages in the DLQ | A file breaks the pipeline deterministically | Pull it and reproduce locally (below) |
 | `403 forbidden` on `mode=full` | Key lacks the `deep` scope | Reissue with `--scopes screen,analyze,deep,read` |
-| First analysis after idle takes minutes | Cold start, no warm pool | `warm_pool_size = 2` |
+| First analysis after idle takes minutes | No warm pool | `WARM_POOL_SIZE=1 ./05-apply.sh` |
+| Deployed to the wrong region | — | The provider is pinned to `var.region`, which `05-apply.sh` sets from `AWS_REGION` |
 
 ### A file in the DLQ
 
-Messages land there after three failed attempts, which means the failure is
-deterministic rather than transient. Reproduce locally rather than guessing:
+Three failed attempts means the failure is deterministic, not transient.
+Reproduce it locally rather than guessing:
 
 ```bash
 aws sqs receive-message --queue-url $(terraform output -raw dlq_url) \
   --max-number-of-messages 1
-# take the s3 key out of the body
-aws s3 cp s3://labs-test-audio-$ACCOUNT_ID/uploads/<key> /tmp/bad.mp3
+aws s3 cp s3://<audio-bucket>/uploads/<key> /tmp/bad.mp3
 python -m labs analyse /tmp/bad.mp3 --mode full
 ```
+
+---
+
+## Doing it by hand
+
+The scripts are ordinary bash and are meant to be read — each one documents
+why it does what it does. If you need to run a piece manually, read the script
+for that stage rather than following a parallel copy of the same commands in a
+document, which is the copy that goes stale.
+
+Two constraints are worth repeating because violating either produces a
+confusing failure rather than a clear one:
+
+**ECR repository names are not free choices.** Terraform builds the image
+reference as `${var.name}-screen` and `${var.name}-worker`. With
+`STACK_NAME=labs-test` the repositories must be `labs-test-screen` and
+`labs-test-worker`. Any other name produces a deploy that applies cleanly and
+then cannot pull.
+
+**ARM64 is not a choice either.** The workers are Graviton and the Fargate
+tasks are ARM. An x86 image fails with `exec format error`, which names
+neither the architecture nor the image.
