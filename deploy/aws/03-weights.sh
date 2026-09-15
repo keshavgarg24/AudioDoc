@@ -23,9 +23,62 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 ACCOUNT_ID=$(aws_account_id)
 BUCKET="${WEIGHTS_BUCKET:-$STACK_NAME-weights-$ACCOUNT_ID}"
 CKPT_DIR="$REPO_ROOT/checkpoints"
-S3_PREFIX="models/checkpoints"
+
+# The prefix that becomes LABS_MODELS_S3_URI. Everything under it is mirrored
+# into the container's /models directory, so the checkpoints must end up at
+# <prefix>/checkpoints/Stage-N.ckpt for the resolver to find them at
+# /models/checkpoints/Stage-N.ckpt.
+#
+# Override WEIGHTS_PREFIX when pointing at a bucket that already has a layout,
+# e.g. an existing bucket holding checkpoints/Stage-1.ckpt at the root wants
+# WEIGHTS_PREFIX="" rather than the default.
+WEIGHTS_PREFIX="${WEIGHTS_PREFIX-models}"
+if [[ -n "$WEIGHTS_PREFIX" ]]; then
+  S3_PREFIX="$WEIGHTS_PREFIX/checkpoints"
+  S3_URI="s3://$BUCKET/$WEIGHTS_PREFIX"
+else
+  S3_PREFIX="checkpoints"
+  S3_URI="s3://$BUCKET"
+fi
 
 step "Level-2 checkpoints -> s3://$BUCKET/$S3_PREFIX"
+
+# If they are already there, there is nothing to do regardless of whether a
+# local copy exists. Checked before anything else so pointing at an existing
+# bucket costs one ListObjects call rather than a 1.3 GB re-upload.
+if aws s3 ls "s3://$BUCKET/$S3_PREFIX/Stage-1.ckpt" >/dev/null 2>&1 \
+&& aws s3 ls "s3://$BUCKET/$S3_PREFIX/Stage-2.ckpt" >/dev/null 2>&1; then
+  reuse "both checkpoints already at s3://$BUCKET/$S3_PREFIX"
+  tfvar_set "$WEIGHTS_TFVARS" weights_s3_uri "\"$S3_URI\""
+
+  # Pin the digests from the local copies if they exist. The point of a digest
+  # is to detect a checkpoint that is not the one you think it is, so hashing
+  # the local file and trusting S3 to match would defeat it - compare the
+  # bucket's own ETag-independent size first, and tell the operator plainly
+  # when the pin cannot be established.
+  if [[ -f "$CKPT_DIR/Stage-1.ckpt" && -f "$CKPT_DIR/Stage-2.ckpt" ]]; then
+    for f in Stage-1.ckpt Stage-2.ckpt; do
+      lsz=$(wc -c < "$CKPT_DIR/$f" | tr -d ' ')
+      rsz=$(aws s3api head-object --bucket "$BUCKET" --key "$S3_PREFIX/$f" \
+        --query ContentLength --output text 2>/dev/null || echo "")
+      [[ "$lsz" == "$rsz" ]] || die "$f differs: local $lsz bytes, S3 $rsz bytes.
+    The digest pinned from the local file would not describe what the workers
+    load. Reconcile them before deploying."
+    done
+    SHA1=$(shasum -a 256 "$CKPT_DIR/Stage-1.ckpt" | cut -d' ' -f1)
+    SHA2=$(shasum -a 256 "$CKPT_DIR/Stage-2.ckpt" | cut -d' ' -f1)
+    cat > "$AWS_DIR/.weights-digests" <<EOF
+LABS_STAGE1_SHA256=$SHA1
+LABS_STAGE2_SHA256=$SHA2
+EOF
+    ok "sizes match the local copies; digests pinned"
+  else
+    warn "no local copy, so the digests cannot be pinned."
+    warn "The workers will load whatever is in the bucket, unverified."
+  fi
+  ok "wrote $(basename "$WEIGHTS_TFVARS")"
+  exit 0
+fi
 
 # ------------------------------------------------------------------ source --
 need_download=0
@@ -34,19 +87,9 @@ for f in Stage-1.ckpt Stage-2.ckpt; do
 done
 
 if [[ "$need_download" == "1" ]]; then
-  # Maybe they are already in S3 from an earlier run on another machine, in
-  # which case there is nothing to do and no reason to pull 1.3 GB.
-  if aws s3 ls "s3://$BUCKET/$S3_PREFIX/Stage-1.ckpt" >/dev/null 2>&1 \
-  && aws s3 ls "s3://$BUCKET/$S3_PREFIX/Stage-2.ckpt" >/dev/null 2>&1; then
-    reuse "both checkpoints already in s3://$BUCKET/$S3_PREFIX"
-    tfvar_set "$WEIGHTS_TFVARS" weights_s3_uri "\"s3://$BUCKET/models\""
-    warn "digests not pinned: the local files are absent so they cannot be hashed."
-    warn "To pin them, fetch the checkpoints locally and re-run this script."
-    ok "wrote $(basename "$WEIGHTS_TFVARS")"
-    exit 0
-  fi
-
-  step "Checkpoints not found locally - downloading from Hugging Face"
+  # The bucket was already checked above and does not have them, so there is
+  # genuinely nowhere else to look.
+  step "Checkpoints not found locally or in S3 - downloading from Hugging Face"
   info "Stage-1 is 1.2 GB. This is a one-off; afterwards they come from your bucket."
 
   python3 - "$CKPT_DIR" <<'PY' || die "download failed.
@@ -124,7 +167,7 @@ SHA2=$(shasum -a 256 "$CKPT_DIR/Stage-2.ckpt" | cut -d' ' -f1)
 info "Stage-1 ${SHA1:0:16}..."
 info "Stage-2 ${SHA2:0:16}..."
 
-tfvar_set "$WEIGHTS_TFVARS" weights_s3_uri "\"s3://$BUCKET/models\""
+tfvar_set "$WEIGHTS_TFVARS" weights_s3_uri "\"$S3_URI\""
 
 # Not a tfvars entry: these are consumed by the containers as env vars, and
 # the task definition reads them from stack.auto.tfvars via Terraform only if
