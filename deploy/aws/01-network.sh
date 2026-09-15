@@ -39,13 +39,13 @@ make_subnet() {
   local tag="$STACK_NAME-$suffix" id
   id=$(find_by_tag subnets "$tag" 'Subnets[0].SubnetId')
   if [[ -n "$id" ]]; then
-    reuse "subnet $tag = $id"
+    reuse "subnet $tag = $id" >&2
   else
     id=$(aws ec2 create-subnet --vpc-id "$VPC_ID" --cidr-block "$cidr" \
       --availability-zone "$az" \
       --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=$tag},{Key=Tier,Value=$tier}]" \
       --query Subnet.SubnetId --output text)
-    ok "subnet $tag = $id ($cidr, $az)"
+    ok "subnet $tag = $id ($cidr, $az)" >&2
   fi
   printf '%s' "$id"
 }
