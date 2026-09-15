@@ -40,7 +40,8 @@ MONGO_SECRET_ID="$STACK_NAME/mongo-uri"
 MONGO_URI=$(aws secretsmanager get-secret-value --secret-id "$MONGO_SECRET_ID" \
   --query SecretString --output text)
 
-KEY_OUTPUT=$(docker run --rm -e LABS_MONGO_URI="$MONGO_URI" "$WORKER_IMAGE" \
+KEY_OUTPUT=$(docker run --rm --platform linux/amd64 \
+  -e LABS_MONGO_URI="$MONGO_URI" "$WORKER_IMAGE" \
   python -m labs.cli.manage_keys create \
   --name "smoke-test" --scopes screen,analyze,deep,read 2>&1) \
   || die "could not create an API key:
