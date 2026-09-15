@@ -73,7 +73,7 @@ if [[ -z "$SAMPLE" ]]; then
 else
   curl -fsS -X POST "$BASE/v1/screen" -H "X-API-Key: $API_KEY" \
     -F "file=@$SAMPLE" \
-    | python3 -c 'import sys,json; d=json.load(sys.stdin); print(f"    verdict={d.get(\"verdict\")} next_step={d.get(\"next_step\")} elapsed={d.get(\"elapsed_s\")}s")' \
+    | python3 -c 'import sys,json; d=json.load(sys.stdin); print("    verdict={} next_step={} elapsed={}s".format(d.get("verdict"),d.get("next_step"),d.get("elapsed_s")))' \
     || die "Level 1 failed. The ONNX weights ship in the image, so a failure
     here is the image itself rather than anything in S3."
   ok "Level 1 answered"
