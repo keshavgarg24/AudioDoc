@@ -926,7 +926,7 @@ resource "aws_appautoscaling_policy" "api" {
 # Worker fleet: EC2 Graviton, scaled on queue backlog
 ###############################################################################
 data "aws_ssm_parameter" "ecs_ami" {
-  name = "/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id"
+  name = "/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id"
 }
 
 resource "aws_launch_template" "worker" {
@@ -1083,10 +1083,10 @@ resource "aws_ecs_task_definition" "worker" {
   family                   = "${var.name}-worker"
   requires_compatibilities = ["EC2"]
   network_mode             = "awsvpc"
-  # 4 vCPU / 8 GiB per task, so a c7g.2xlarge hosts two. The backbone wants
-  # ~4 GB resident and the DSP passes peak above that on a long track.
-  cpu                = 4096
-  memory             = 8192
+  # 2 vCPU / 6 GiB per task, sized for m7i-flex.large (2 vCPU, 8 GiB).
+  # The backbone wants ~3.5 GB resident; 6 GiB leaves room for the DSP peak.
+  cpu                = 2048
+  memory             = 6144
   execution_role_arn = aws_iam_role.execution.arn
   task_role_arn      = aws_iam_role.worker.arn
 
@@ -1100,12 +1100,10 @@ resource "aws_ecs_task_definition" "worker" {
       # each go at half speed for identical throughput. Capacity comes from
       # more containers; the variable below sizes the one container.
       #
-      # Physical cores, not vCPUs. Graviton has no SMT so these are equal
-      # here, which is another reason to prefer it for this workload - on x86
-      # the right value is half the vCPU count and getting it wrong costs
-      # throughput to cache contention.
-      { name = "LABS_TORCH_THREADS", value = "4" },
-      { name = "OMP_NUM_THREADS", value = "4" },
+      # x86 with HyperThreading: 2 vCPUs = 1 physical core + 1 HT thread.
+      # Setting threads to vCPU count (2) uses both HT threads for inference.
+      { name = "LABS_TORCH_THREADS", value = "2" },
+      { name = "OMP_NUM_THREADS", value = "2" },
       { name = "LABS_EAGER_LOAD", value = "true" },
     ])
     logConfiguration = {
