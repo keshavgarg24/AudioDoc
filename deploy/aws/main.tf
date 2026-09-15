@@ -958,6 +958,11 @@ resource "aws_launch_template" "worker" {
     # analysis the caller was told had been accepted.
     echo "ECS_ENABLE_SPOT_INSTANCE_DRAINING=true" >> /etc/ecs/ecs.config
     echo "ECS_CONTAINER_STOP_TIMEOUT=3m" >> /etc/ecs/ecs.config
+    # The worker runs as uid 10001 (labs). ECS creates host-path volume
+    # directories as root, so the container cannot write the checkpoint cache.
+    # Pre-create with the right ownership before the agent starts.
+    mkdir -p /opt/labs/models/checkpoints
+    chown -R 10001:10001 /opt/labs/models
   EOT
   )
 
