@@ -34,6 +34,18 @@ uvicorn[standard]==0.52.4
 python-multipart==0.0.32
 requests==2.34.2
 
+# --- creative tools --------------------------------------------------------
+# The /v1/tools endpoints run IN THIS CONTAINER, not on the worker, so every
+# library they reach for has to be installed here. `pyloudnorm` backs
+# analysis.production.loudness, which master-check, vocal-lab,
+# reference-match and beat-vocal-fit all call on their first pass - four of
+# the six tools returned "could not complete on this input" without it, and
+# the tier that actually needs it is this one, not the deep image.
+#
+# It is in requirements.txt too. That file builds the worker, which never
+# runs a tool, so its presence there is what made this look installed.
+pyloudnorm==0.2.0
+
 # --- persistence (optional at runtime) -------------------------------------
 # Present so a screen-only container can still record usage and read the
 # shared job collection. Both are inert until their env vars are set.
