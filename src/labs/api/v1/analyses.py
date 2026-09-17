@@ -381,12 +381,31 @@ async def create_analysis(
     # eviction only reclaims terminal jobs, so it would leak a slot, inflate
     # the queue depth on /health, and never be collected.
     limiter, bucket = get_limiter(), bucket_for(who)
-    if not limiter.acquire(bucket, settings.server.max_inflight_per_key):
+    cap = settings.server.max_inflight_per_key
+    if not limiter.acquire(bucket, cap):
         _unlink(path)
         raise api_error(429, "too_many_inflight",
-                        f"This key already has "
-                        f"{settings.server.max_inflight_per_key} analyses in "
+                        f"This key already has {cap} analyses in "
                         f"flight. Wait for one to finish.")
+
+    # The local slot above bounds this PROCESS. On the distributed path it is
+    # released as soon as the job reaches SQS, and there is more than one API
+    # container, so on its own it bounds nothing fleet-wide: one key can fill
+    # the queue and starve every other caller. Ask the shared job collection
+    # what this key actually has outstanding.
+    #
+    # `None` means the store could not answer. That is deliberately treated as
+    # "admit" - a Mongo blip must degrade the cap, not the service.
+    if remote and who.id:
+        from ...services.storage import get_mongo
+        active = get_mongo().count_active_jobs(who.id)
+        if active is not None and active >= cap:
+            limiter.release(bucket)
+            _unlink(path)
+            raise api_error(429, "too_many_inflight",
+                            f"This key already has {active} analyses queued or "
+                            f"running across the fleet (limit {cap}). Wait for "
+                            f"one to finish.")
 
     job = None
     try:

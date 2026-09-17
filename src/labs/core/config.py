@@ -491,8 +491,21 @@ class ServerConfig:
     eager_load: bool = field(default_factory=lambda: _env_bool("LABS_EAGER_LOAD", True))
     require_auth: bool = field(default_factory=lambda: _env_bool("LABS_REQUIRE_AUTH", False))
     # Requests per minute per key. 0 disables the limiter.
+    #
+    # PER CONTAINER, not per fleet. The window lives in process memory, so
+    # behind a load balancer a key's real allowance is this value times the
+    # number of API replicas: at 2 replicas, 60 here admits 120/min. Measured,
+    # not theoretical - 90 rapid reads against a 60/min limit produced zero
+    # 429s because they split across two containers.
+    #
+    # Set it to the fleet-wide target DIVIDED by the replica count, or move the
+    # window into Redis for a limit that means what it says. The in-flight cap
+    # below is enforced fleet-wide against MongoDB instead, because queue
+    # flooding is the abuse that actually costs money.
     rate_limit_per_min: int = field(default_factory=lambda: _env_int("LABS_RATE_LIMIT_PER_MIN", 60))
-    # Concurrent in-flight analyses a single key may hold.
+    # Concurrent in-flight analyses a single key may hold. Enforced fleet-wide
+    # on the distributed path by counting queued/running jobs in MongoDB; the
+    # in-process slot is a fast local guard in front of that.
     max_inflight_per_key: int = field(default_factory=lambda: _env_int("LABS_MAX_INFLIGHT_PER_KEY", 4))
     # Signs outbound webhooks so the receiver can verify authenticity.
     webhook_secret: Optional[str] = field(

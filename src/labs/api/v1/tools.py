@@ -178,9 +178,31 @@ async def run_tool(
 
         params = {"genre": genre} if genre else {}
 
+        # Mirror the job into MongoDB so a poll can be answered by a container
+        # that did not run it.
+        #
+        # A tool runs IN THIS PROCESS, so `get_store()` only ever knows about
+        # jobs this replica accepted. Behind a load balancer that makes
+        # /v1/tools/results/{id} a coin flip: the replica that ran the tool
+        # answers 200, every other replica answers 404, and a client that
+        # treats its first 404 as "no such job" - which is what 404 means -
+        # gives up on a run that is progressing normally. The tool_results
+        # collection does not help here; it is keyed by a content hash for
+        # caching, not by job id.
+        _mirror_job(job.id, who.id, slug, request_id)
+
         def work(progress):
-            return runner.run(slug, paths, params, progress=progress,
-                              use_cache=not no_cache)
+            _mirror_update(job.id, status="running", progress="running")
+            try:
+                result = runner.run(slug, paths, params, progress=progress,
+                                    use_cache=not no_cache)
+            except Exception as exc:
+                _mirror_update(job.id, status="failed", progress="failed",
+                               error=str(exc)[:500])
+                raise
+            _mirror_update(job.id, status="succeeded", progress="complete",
+                           result=result)
+            return result
 
         def cleanup():
             limiter.release(bucket)
@@ -213,18 +235,73 @@ async def run_tool(
             responses={404: {"model": ErrorResponse}})
 def get_result(job_id: str, who=Depends(require_scope("read"))):
     job = get_store().get(job_id)
-    if not job or not job.owned_by(who.id):
-        # Same 404 either way: distinguishing "does not exist" from "not
-        # yours" tells an attacker which ids are real.
-        raise api_error(404, "not_found",
-                        "No tool run with that id. Results are held for a "
-                        "limited window after completion.")
-    # Coerced, not returned raw: a tool result assembled from stored
-    # data can carry datetimes, and JSONResponse raises on those.
-    return JSONResponse(status_code=200, content=jsonable(job.public()))
+    if job and job.owned_by(who.id):
+        # Coerced, not returned raw: a tool result assembled from stored
+        # data can carry datetimes, and JSONResponse raises on those.
+        return JSONResponse(status_code=200, content=jsonable(job.public()))
+
+    # Not in this process. With more than one replica that is the ordinary
+    # case rather than an error, so the shared record is consulted before
+    # giving the caller a 404 they would reasonably act on.
+    if job is None:
+        mirrored = _mirrored_body(job_id, who)
+        if mirrored is not None:
+            return JSONResponse(status_code=200, content=jsonable(mirrored))
+
+    # Same 404 either way: distinguishing "does not exist" from "not
+    # yours" tells an attacker which ids are real.
+    raise api_error(404, "not_found",
+                    "No tool run with that id. Results are held for a "
+                    "limited window after completion.")
 
 
 # ----------------------------------------------------------------- helpers --
+# Every mirror call is best effort. The local store remains the source of
+# truth for the replica that is running the tool, so a MongoDB outage costs
+# cross-replica visibility - the thing that was broken before this existed -
+# and never the run itself.
+def _mirror_job(job_id: str, api_key_id: Optional[str], slug: str,
+                request_id: str) -> None:
+    try:
+        from ...services.storage import get_mongo
+        get_mongo().create_job(job_id,
+                               {"kind": "tool", "tool": slug,
+                                "request_id": request_id},
+                               api_key_id=api_key_id)
+    except Exception:
+        log.debug("Could not mirror tool job %s", job_id, exc_info=True)
+
+
+def _mirror_update(job_id: str, **fields) -> None:
+    try:
+        from ...services.storage import get_mongo
+        get_mongo().update_job(job_id, **fields)
+    except Exception:
+        log.debug("Could not update mirrored tool job %s", job_id, exc_info=True)
+
+
+def _mirrored_body(job_id: str, who) -> Optional[Dict]:
+    """Shared state for a tool run this container never executed."""
+    try:
+        from ...services.storage import get_mongo
+        doc = get_mongo().get_job(job_id)
+    except Exception:
+        return None
+    if not doc or doc.get("kind") != "tool":
+        return None
+    # Ownership is checked here too, not only on the local path: a fallback
+    # that skips it would hand any caller any tool result by id.
+    if who.id and doc.get("api_key_id") and doc["api_key_id"] != who.id:
+        return None
+    return {"id": job_id, "status": doc.get("status", "running"),
+            "progress": doc.get("progress", doc.get("status", "running")),
+            "tool": doc.get("tool"), "created_at": doc.get("created_at"),
+            "started_at": doc.get("started_at"),
+            "finished_at": doc.get("finished_at"),
+            "error": doc.get("error"), "source": "shared",
+            "result": doc.get("result")}
+
+
 def _stage(upload: UploadFile, tag: str) -> str:
     """Stream an upload to disk, enforcing type and size as it goes."""
     from ...core.uploads import stage_prefix, stage_upload

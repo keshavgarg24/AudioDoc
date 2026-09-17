@@ -420,6 +420,12 @@ class MongoStore:
             db.jobs.create_index([("api_key_id", ASCENDING),
                                   ("created_at", DESCENDING)])
             db.jobs.create_index([("status", ASCENDING)])
+            # Serves count_active_jobs, which runs on every distributed
+            # submission. Without the compound index that count scans every
+            # job the key has ever created, so it gets slower for exactly the
+            # heavy users it exists to bound.
+            db.jobs.create_index([("api_key_id", ASCENDING),
+                                  ("status", ASCENDING)])
             db.jobs.create_index([("expires_at", ASCENDING)],
                                  expireAfterSeconds=0)
 
@@ -483,6 +489,32 @@ class MongoStore:
             return self.db().jobs.find_one({"_id": job_id})
         except Exception:
             log.debug("Job lookup failed for %s", job_id, exc_info=True)
+            return None
+
+    def count_active_jobs(self, api_key_id: str) -> Optional[int]:
+        """How many jobs this key currently has queued or running, fleet-wide.
+
+        The in-process limiter cannot answer this. It counts what THIS
+        container admitted, so behind a load balancer the real cap is the
+        configured one multiplied by the number of API containers, and the
+        distributed path releases its slot the moment the job is handed to
+        SQS - by design, since holding it would cap a key across the whole
+        fleet at a number meant to bound one process. The net effect is that
+        nothing bounds how much queue one key can occupy.
+
+        Counting the shared job collection is the only answer that is true for
+        the deployment rather than for one replica. Returns None when the store
+        is unavailable, and callers must treat that as "do not know" and admit
+        the request: a database blip must not become a service outage.
+        """
+        if not self.enabled:
+            return None
+        try:
+            return self.db().jobs.count_documents(
+                {"api_key_id": api_key_id,
+                 "status": {"$in": ["queued", "running"]}})
+        except Exception:
+            log.debug("Active-job count failed for %s", api_key_id, exc_info=True)
             return None
 
     def job_is_terminal(self, job_id: str) -> bool:
