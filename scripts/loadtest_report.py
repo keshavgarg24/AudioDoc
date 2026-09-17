@@ -47,10 +47,11 @@ def table(rows, widths, align_right=(), size=7.4, header=True):
     return t
 
 def stats_row(name, vals):
-    if not vals: return [name,"0","-","-","-","-","-"]
+    if not vals: return [name,"0","-","-","-","-","-","-"]
     v=sorted(vals)
     q=lambda p: v[min(len(v)-1,int(p*(len(v)-1)))]
-    return [name,str(len(v)),fmt(v[0]),fmt(sst.median(v)),fmt(q(.90)),fmt(q(.99)),fmt(v[-1])]
+    return [name,str(len(v)),fmt(v[0]),fmt(sst.median(v)),fmt(q(.90)),
+            fmt(q(.95)),fmt(q(.99)),fmt(v[-1])]
 
 def build(path_results, path_stress, out):
     d=json.load(open(path_results)); rows=d['results']
@@ -65,13 +66,18 @@ def build(path_results, path_stress, out):
       f"{d['users']} concurrent users, {len(rows)} previously-unused beats, "
       f"wall clock <b>{d['wall_s']}s ({d['wall_s']/60:.1f} min)</b>. "
       f"Completed <b>{len(ok)}/{len(rows)}</b>.", BODY)
-    A("Every track in this corpus is AI-generated, so only <b>recall</b> is measured here; "
-      "these figures contain no false-positive rate and cannot separate a model error from a "
-      "mislabelled file.", SMALL)
+    if os.environ.get("LABS_TRUTH_FILE"):
+        A("Labels are corrected against known ground truth, so this run yields a real "
+          "false-positive rate as well as recall. The sample is small and human-heavy only "
+          "by a handful of tracks, so treat specificity as indicative rather than settled.", SMALL)
+    else:
+        A("Every track in this corpus is assumed AI-generated, so only <b>recall</b> is measured "
+          "here; these figures contain no false-positive rate and cannot separate a model error "
+          "from a mislabelled file.", SMALL)
 
     # ---------------- 1 latency
     A("1 &nbsp;Latency and throughput", H2)
-    hdr=["measurement","n","min","p50","p90","p99","max"]
+    hdr=["measurement","n","min","p50","p90","p95","p99","max"]
     tbl=[hdr,
          stats_row("L1 round trip (s)",[r['l1_round_trip_s'] for r in rows if r.get('l1_round_trip_s')]),
          stats_row("L1 server (s)",[r['l1_server_s'] for r in rows if r.get('l1_server_s')]),
@@ -80,7 +86,7 @@ def build(path_results, path_stress, out):
          stats_row("L2 compute (s)",[r['l2_server_s'] for r in ok if r.get('l2_server_s')]),
          stats_row("Poll latency (s)",[r['poll_lat_med'] for r in ok if r.get('poll_lat_med')])]
     tbl=[tbl[0]]+[r for r in tbl[1:] if r[1]!="0"]
-    story.append(table(tbl,[46*mm,12*mm,20*mm,20*mm,20*mm,20*mm,20*mm],align_right=(1,2,3,4,5,6)))
+    story.append(table(tbl,[40*mm,10*mm,17*mm,17*mm,17*mm,17*mm,17*mm,17*mm],align_right=(1,2,3,4,5,6,7)))
     story.append(Spacer(1,3*mm))
     A("L2 end-to-end includes queue wait. With 4 workers and 50 jobs arriving at once, "
       "queue wait dominates and is not a per-request latency figure.", SMALL)
@@ -112,6 +118,41 @@ def build(path_results, path_stress, out):
 
     # ---------------- 3 detection
     A("3 &nbsp;Detection outcome", H2)
+    TRUE_HUMAN=set(json.load(open(os.environ["LABS_TRUTH_FILE"]))) if os.environ.get("LABS_TRUTH_FILE") else set()
+    def truth(r): return 'human-made' if r['beat'].replace('.mp3','') in TRUE_HUMAN else 'ai-generated'
+    def confusion(key):
+        TP=FP=TN=FN=0
+        for r in rows:
+            p=r.get(key)
+            if p is None: continue
+            t=truth(r)
+            if t=='ai-generated': TP,FN=(TP+1,FN) if p=='ai-generated' else (TP,FN+1)
+            else: FP,TN=(FP+1,TN) if p=='ai-generated' else (FP,TN+1)
+        n=TP+FP+TN+FN or 1
+        rec=TP/(TP+FN) if TP+FN else 0; pre=TP/(TP+FP) if TP+FP else 0
+        spe=TN/(TN+FP) if TN+FP else 0; f1=2*pre*rec/(pre+rec) if pre+rec else 0
+        return dict(TP=TP,FP=FP,TN=TN,FN=FN,rec=rec,pre=pre,spe=spe,acc=(TP+TN)/n,f1=f1)
+    if TRUE_HUMAN:
+        nh=sum(1 for r in rows if truth(r)=='human-made')
+        A(f"Ground truth corrected: <b>{nh}</b> of {len(rows)} tracks in this sample are "
+          f"human-made, not AI. Metrics below use the corrected labels, so a "
+          f"<i>human-made</i> call on those tracks counts as correct.", BODY)
+        cm=[["tier","TP","FP","TN","FN","recall (AI)","precision","specificity","accuracy","F1"]]
+        for nm,k in (("Level 1","l1_label"),("Level 2 (final)","l2_label")):
+            c=confusion(k)
+            cm.append([nm,str(c['TP']),str(c['FP']),str(c['TN']),str(c['FN']),
+                       f"{c['rec']*100:.1f}%",f"{c['pre']*100:.1f}%",f"{c['spe']*100:.1f}%",
+                       f"{c['acc']*100:.1f}%",f"{c['f1']:.3f}"])
+        story.append(table(cm,[28*mm,10*mm,10*mm,10*mm,10*mm,20*mm,18*mm,20*mm,18*mm,14*mm],
+                           align_right=tuple(range(1,10))))
+        story.append(Spacer(1,3*mm))
+        dec=[r for r in rows if r.get('l2_verdict') in ('ai-generated','human-made')]
+        cor=sum(1 for r in dec if r['l2_verdict']==truth(r))
+        A(f"On the banded <b>final verdict</b>, the system commits on "
+          f"<b>{len(dec)}/{len(rows)}</b> tracks and is correct on <b>{cor}/{len(dec)} "
+          f"({cor/max(1,len(dec))*100:.1f}%)</b>; it abstains as <i>inconclusive</i> on "
+          f"{len(rows)-len(dec)}.", BODY)
+        story.append(Spacer(1,3*mm))
     l1=Counter(r.get('l1_label') for r in rows)
     l2=Counter(r.get('l2_label') for r in ok)
     b1=Counter(r.get('l1_band') for r in rows)
@@ -170,17 +211,21 @@ def build(path_results, path_stress, out):
 
     # ---------------- 5 per-user table (long; Platypus paginates it)
     A("5 &nbsp;Per-user detail", H2)
-    hdr=["user","beat","MB","strategy","L1 s","L1","L2 s","polls","L2","score"]
+    hdr=["user","beat","MB","L1","L2","FINAL verdict","band","score","truth","ok"]
     prow=[hdr]
     for r in sorted(rows,key=lambda x:(x.get('total_s') or 9e9)):
+        sh=lambda x:(x or '-').replace('ai-generated','AI').replace('human-made','human').replace('inconclusive','inconcl.')
+        t=truth(r) if TRUE_HUMAN else None
+        good='-' if not t else ('yes' if r.get('l2_label')==t else 'NO')
         prow.append([r['user'], r['beat'].replace('.mp3',''), fmt(r.get('size_mb'),1),
-                     r.get('strategy','-'), fmt(r.get('l1_round_trip_s'),1),
-                     (r.get('l1_label') or '-').replace('ai-generated','AI').replace('human-made','human'),
-                     fmt(r.get('total_s'),0), str(r.get('polls','-')),
-                     (r.get('l2_label') or r.get('status') or '-').replace('ai-generated','AI').replace('human-made','human'),
-                     fmt(r.get('l2_score'),3)])
-    story.append(table(prow,[14*mm,22*mm,12*mm,24*mm,14*mm,16*mm,16*mm,14*mm,18*mm,16*mm],
-                       align_right=(2,4,6,7,9)))
+                     sh(r.get('l1_label')), sh(r.get('l2_label')),
+                     sh(r.get('l2_verdict')), (r.get('l2_band') or '-'),
+                     fmt(r.get('l2_score'),3), sh(t) if t else '-', good])
+    story.append(table(prow,[13*mm,21*mm,11*mm,16*mm,16*mm,22*mm,24*mm,16*mm,16*mm,11*mm],
+                       align_right=(2,7)))
+    A("FINAL verdict is the banded answer the API returns (decided_by = level_2_deep); "
+      "L1/L2 are each tier's unconditional binary label. 'ok' compares the final label "
+      "against corrected ground truth.", SMALL)
 
     # ---------------- doc with page numbers in the footer (canvas only here)
     def footer(canv,doc):
