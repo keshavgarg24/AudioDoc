@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build both container images and push them to ECR.
+# Build both container images for ARM64 and push them to ECR.
 #
 # THE REPOSITORY NAMES ARE NOT FREE CHOICES. Terraform builds the image
 # reference as "${var.name}-screen" and "${var.name}-worker", so with
@@ -9,9 +9,12 @@
 # that does not exist.
 #
 # THE ARCHITECTURES ARE NOT FREE CHOICES EITHER.
-#   screen  -> linux/arm64  (runs on Fargate ARM64)
-#   worker  -> linux/amd64  (runs on EC2 x86, e.g. m7i-flex.large)
-# Mismatched architecture fails with 'exec format error'.
+#   screen  -> linux/arm64, always: it runs on Fargate ARM64.
+#   worker  -> derived from WORKER_INSTANCE_TYPE, because the worker fleet can
+#              be Graviton (c7g) or x86 (m7i-flex) depending on what the region
+#              has capacity for.
+# A mismatch fails with `exec format error`, which names neither the
+# architecture nor the image.
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -58,10 +61,28 @@ else
   reuse "buildx builder"
 fi
 
-# screen runs on Fargate ARM64; worker runs on EC2 x86_64 (m7i-flex family).
-# They are built for different platforms because they run on different hosts.
-declare -A TARGET_PLATFORM=( [screen]=linux/arm64 [worker]=linux/amd64 )
-declare -A TARGET_ARCH=(     [screen]=arm64       [worker]=amd64 )
+# The two images run on different hosts, so they are built for different
+# architectures:
+#
+#   screen  -> Fargate ARM64, always
+#   worker  -> whatever WORKER_INSTANCE_TYPE is, which may be either
+#
+# The worker's architecture is DERIVED from the instance type rather than set
+# by hand, using the same rule main.tf uses to pick the ECS AMI: Graviton
+# families end their size prefix in `g` (c7g, m7g, r8g, t4g), everything else
+# is x86_64. Hardcoding it in two places is how you get an image and an AMI
+# that disagree, and that failure surfaces only as `exec format error` on a
+# task that has already pulled 2 GB.
+WORKER_FAMILY="${WORKER_INSTANCE_TYPE%%.*}"
+if [[ "$WORKER_FAMILY" =~ g[a-z]*$ ]]; then
+  WORKER_PLATFORM="linux/arm64"; WORKER_ARCH="arm64"
+else
+  WORKER_PLATFORM="linux/amd64"; WORKER_ARCH="amd64"
+fi
+info "worker instance type ${WORKER_INSTANCE_TYPE:-unset} -> $WORKER_PLATFORM"
+
+declare -A TARGET_PLATFORM=( [screen]=linux/arm64 [worker]="$WORKER_PLATFORM" )
+declare -A TARGET_ARCH=(     [screen]=arm64       [worker]="$WORKER_ARCH" )
 
 for target in screen worker; do
   image="$ECR_HOST/$STACK_NAME-$target:$IMAGE_TAG"
@@ -82,7 +103,6 @@ done
 # this catches, and it is far cheaper to catch here than as a PENDING task.
 step "Verifying what landed in ECR"
 for target in screen worker; do
-  want="${TARGET_ARCH[$target]}"
   arch=$(aws ecr batch-get-image --repository-name "$STACK_NAME-$target" \
     --image-ids "imageTag=$IMAGE_TAG" \
     --query 'images[0].imageManifest' --output text 2>/dev/null \
@@ -92,6 +112,7 @@ if "manifests" in m:
     print(",".join(x["platform"]["architecture"] for x in m["manifests"]))
 else:
     print("single-manifest")' 2>/dev/null || echo "unknown")
+  want="${TARGET_ARCH[$target]}"
   if [[ "$arch" == *"$want"* ]]; then
     ok "$STACK_NAME-$target:$IMAGE_TAG is $want"
   else

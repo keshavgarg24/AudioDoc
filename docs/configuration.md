@@ -193,7 +193,13 @@ its cost is a product decision as much as an engineering one.
 | `LABS_SCREEN_CNN_WEIGHT` | `0.45` | |
 | `LABS_SCREEN_AI_THRESHOLD` | `0.80` | Asymmetric on purpose. Wrongly flagging a human producer is the expensive error. |
 | `LABS_SCREEN_HUMAN_THRESHOLD` | `0.20` | The gap between the two is reported as `inconclusive`, not rounded. |
-| `LABS_SCREEN_MIN_CONFIDENCE` | `0.45` | Below this, no verdict is published. |
+| `LABS_SCREEN_MIN_CONFIDENCE` | `0.45` | Below this, no verdict is published. Enforced **twice** — once when the policy bands, and again after the robustness penalty, which can move confidence after the fact. See `policy.reband`. |
+| `LABS_UNCERTAIN_MARGIN` | `0.15` | Half-width of the `uncertain` band in `assessment.band`. Shared with Level 2 so one legend fits both tiers. Reporting only: it never changes `verdict` and never suppresses `label`. |
+
+These thresholds move `verdict`. **They do not move `label`**, which is always
+the side of 0.5 and is computed in `assessment.py` from the score alone. An
+operator retuning the bars changes how cautious the service is about
+committing, not what it thinks.
 
 ### Early exit
 
@@ -245,6 +251,23 @@ a saturated 1.0 and its confidence collapses to 0.23 under band limiting.
 |---|---|---|
 | `LABS_DEEP_BANDING` | `true` | Report `inconclusive` near the decision boundary. |
 | `LABS_INCONCLUSIVE_BELOW` | `2.0` | `\|logit\|` band. Tracks inside it land on either side of zero depending only on which windows were analysed, so the sign is not a verdict. |
+| `LABS_UNCERTAIN_MARGIN` | `0.15` | Shared with Level 1. See above. |
+
+`LABS_INCONCLUSIVE_BELOW` is expressed in logit space, and
+`assessment.band` grades the score. The two are kept consistent by pushing the
+configured threshold through the **same sigmoid the score uses**
+(`_decisive_bounds` in `ml/detector.py`) rather than hardcoding 0.88 — so
+retuning this variable moves the band with it instead of leaving them
+disagreeing about the same track.
+
+### Turning the band off
+
+Setting `LABS_DEEP_BANDING=false` makes `verdict` the bare sign of the logit,
+with no `inconclusive`. **You almost certainly do not need to do this.**
+`assessment.label` already gives you the unconditional binary call on every
+response, with the band intact alongside it, so the usual reason for reaching
+for this switch is already served. Disabling it only removes your ability to
+tell a coin flip from a finding.
 
 ---
 

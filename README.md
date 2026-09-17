@@ -47,6 +47,30 @@ Level 2 is asynchronous. Submit a file, get a job id, poll it or supply a
 webhook. A long-running analysis never holds an HTTP connection open, which is
 what keeps the service working behind a load balancer.
 
+### One answer shape, whichever tier replies
+
+Every detection response carries an `assessment` block built the same way by
+both tiers — [full reference](docs/api.md#assessment--read-this-one):
+
+```json
+"assessment": {
+  "score": 0.8005,          // P(AI). 0.5 is the boundary.
+  "label": "ai-generated",  // the side of 0.5. ALWAYS answers.
+  "verdict": "inconclusive",// the same score after an uncertainty band.
+  "band": "likely-ai",      // strong-ai · likely-ai · uncertain · likely-human · strong-human
+  "confidence": 0.601,      // |score - 0.5| x 2. 0.0 means "on the boundary".
+  "threshold": 0.5
+}
+```
+
+`label` and `verdict` answer different questions and the service publishes
+both. `label` never abstains, which is what a bulk triage queue needs.
+`verdict` may return `inconclusive`, which is what you want before doing
+something to a producer's account. Rounding a coin flip to the nearer side and
+calling it a finding is how a detector acquires a false-accusation rate it
+cannot see; refusing to answer at all is useless to someone ranking a
+catalogue. Pick by what being wrong costs you.
+
 ## Quick start
 
 ```bash
@@ -108,6 +132,7 @@ re-download them.
 | Document | Covers |
 |---|---|
 | [docs/flow.md](docs/flow.md) | **End-to-end trace**: one upload through both levels, code / architecture / AWS |
+| [docs/flow-diagram.md](docs/flow-diagram.md) | **Nine diagrams**: topology, every decision point, every failure path |
 | [docs/api.md](docs/api.md) | Every endpoint, parameter, response shape and error code |
 | [docs/architecture.md](docs/architecture.md) | How the service is put together and why |
 | [docs/deployment.md](docs/deployment.md) | Topologies, AWS autoscaling, **cost**, concurrency, going live |
@@ -123,6 +148,7 @@ src/labs/
   application.py     ASGI app: logging, lifespan, middleware, routers
   tiers.py           routes a request through Level 1, then Level 2
   verdicts.py        the shared verdict vocabulary (imports nothing, on purpose)
+  assessment.py      score / label / band / confidence, defined once for both tiers
   worker.py          the distributed SQS consumer; serves no HTTP
   api/               HTTP surface — errors, dependencies, field selection
     v1/              screen, analyses, tools, system
@@ -139,9 +165,38 @@ src/labs/
 tests/
   unit/              fast, no model, no network
   integration/       the real ASGI app through TestClient
-deploy/              compose file, nginx, environment template
+  stress/            edge cases, resource safety, load
+scripts/
+  benchmark.py       local throughput measurement
+  aws_benchmark.py   run a corpus through a DEPLOYED stack, record every timing
+  aws_report.py      render a benchmark run into a PDF
+deploy/
+  docker-compose.yml single-container deployment
+  aws/               the production stack: 00-backend .. 07-benchmark, main.tf
 docs/                the table above
 ```
+
+### Deploying
+
+The AWS scripts are numbered and run in order. Each is idempotent and each
+records what it did into `*.auto.tfvars`, so there is no state to carry between
+them by hand:
+
+```
+00-backend.sh    S3 + DynamoDB for Terraform state       once per account
+01-network.sh    VPC, subnets, NAT
+02-secrets.sh    Secrets Manager entries
+03-weights.sh    mirror the checkpoints to S3, pin their SHA-256
+04-images.sh     build + push screen (ARM64) and worker (arch from instance type)
+05-apply.sh      terraform plan + apply
+06-verify.sh     smoke test, cheapest failure first
+07-benchmark.sh  run a corpus through the deployed stack, emit a PDF
+```
+
+Run `00-backend.sh` first. Terraform cannot create its own state backend, and
+without it the only record of a running stack is one file on one laptop — lose
+the directory and the infrastructure keeps billing while Terraform no longer
+knows it exists.
 
 ## Requirements
 

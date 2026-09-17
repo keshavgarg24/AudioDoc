@@ -114,9 +114,34 @@ def analyse(path: str, *, mode: str, settings: Settings,
     if screen_result is not None:
         report.setdefault("detection", {})
         report["detection"]["level_1"] = screen_result.as_dict()
-        report["detection"]["level_agreement"] = _agreement(
-            screen_result, report)
+        agreement = _agreement(screen_result, report)
+        # Verdicts can both be `inconclusive`, which tells a reviewer nothing
+        # about whether the two tiers were leaning the same way. Labels always
+        # exist, so they can always be compared - and two tiers that disagree
+        # on the side of 0.5 is the single most useful thing to sort a review
+        # queue on, whether or not either cleared its own bar.
+        agreement["labels"] = _label_agreement(screen_result, report)
+        report["detection"]["level_agreement"] = agreement
     return report
+
+
+def _label_agreement(screen_result, report: Dict) -> Dict:
+    """Compare the two tiers' unconditional binary calls."""
+    l1 = (screen_result.assessment or {}).get("label")
+    l2 = (report.get("assessment") or {}).get("label")
+    if l1 is None or l2 is None:
+        return {"level_1": l1, "level_2": l2, "match": None,
+                "note": "One tier produced no score, so there is nothing to "
+                        "compare."}
+    return {
+        "level_1": l1,
+        "level_2": l2,
+        "match": l1 == l2,
+        "note": ("Both tiers fall on the same side of 0.5." if l1 == l2 else
+                 "The tiers fall on opposite sides of 0.5. Neither is "
+                 "necessarily wrong - they read different evidence - but this "
+                 "track should not be actioned without review."),
+    }
 
 
 def _screen_only(result, settings: Settings, display_name: Optional[str],
@@ -146,6 +171,10 @@ def _screen_only(result, settings: Settings, display_name: Optional[str],
         "duration": result.duration_s,
         "mode": "screen",
         "verdict": result.verdict,
+        # Hoisted to the top level so `assessment` sits in the same place
+        # whether Level 1 answered alone or Level 2 did. A caller reading
+        # `response["assessment"]["label"]` never has to know which tier ran.
+        "assessment": result.assessment,
         "prediction": prediction,
         "fake_probability": prob,
         "real_probability": round(1.0 - prob, 4) if prob is not None else None,

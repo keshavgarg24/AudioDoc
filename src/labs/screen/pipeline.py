@@ -18,6 +18,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, Optional
 
+from ..assessment import build as build_assessment
 from ..core.config import ScreenConfig, get_settings
 from . import decode, ensemble, models, policy, screens
 from . import robustness as robust
@@ -37,6 +38,10 @@ class ScreenResult:
     next_step: str
     duration_s: Optional[float]
     elapsed_s: float
+    # The cross-tier envelope: score, label, band, confidence, all defined once
+    # in assessment.py so Level 1 and Level 2 publish the same quantities under
+    # the same names. Empty only when no score was produced at all.
+    assessment: Dict[str, Any] = field(default_factory=dict)
     models: Dict[str, Any] = field(default_factory=dict)
     ensemble: Dict[str, Any] = field(default_factory=dict)
     screens: Dict[str, Any] = field(default_factory=dict)
@@ -98,6 +103,16 @@ def run(path: str, cfg: Optional[ScreenConfig] = None,
             confidence=0.0, next_step=policy.NEXT_ESCALATE, duration_s=None,
             elapsed_s=round(time.time() - started, 3), timings=timings,
             errors=errors,
+            # Still an envelope, with a null score. A caller parsing
+            # `assessment` must never have to branch on its absence.
+            assessment=build_assessment(
+                score=None, verdict=policy.VERDICT_UNAVAILABLE,
+                confidence=0.0, decided_by="level_1_none",
+                ai_decisive=cfg.ai_threshold,
+                human_decisive=cfg.human_threshold,
+                uncertain_margin=cfg.uncertain_margin,
+                note="Level 1 could not decode this file, so there is no "
+                     "score to place on either side of the boundary."),
             decision={"verdict": policy.VERDICT_UNAVAILABLE,
                       "reasons": ["Level 1 could not decode this file."],
                       "decided_by": "none", "review_recommended": True})
@@ -154,13 +169,31 @@ def run(path: str, cfg: Optional[ScreenConfig] = None,
             decision.confidence = round(
                 decision.confidence * max(robustness.stability, 0.15), 3)
             decision.review_recommended = True
+            # The penalty can drop confidence below the bar that produced the
+            # verdict, so the verdict has to be re-asked. See policy.reband.
+            policy.reband(decision, cfg)
         elif robustness is not None and robustness.stable:
             decision.reasons.append(
                 "verdict is stable under benign perturbation")
 
+    # Built last, so it reflects the robustness penalty and any re-band rather
+    # than the policy's first answer.
+    assessment = build_assessment(
+        score=decision.probability,
+        verdict=decision.verdict,
+        confidence=decision.confidence,
+        decided_by=f"level_1_{decision.decided_by}",
+        ai_decisive=cfg.ai_threshold,
+        human_decisive=cfg.human_threshold,
+        uncertain_margin=cfg.uncertain_margin,
+        note="Level 1 reads narrowband spectral structure only. A `human-made` "
+             "label here means neither small model recognised an artifact, "
+             "which is not the same as an exoneration.")
+
     return ScreenResult(
         tier=TIER, verdict=decision.verdict, probability=decision.probability,
         confidence=decision.confidence, next_step=decision.next_step,
+        assessment=assessment,
         duration_s=round(audio.full_duration or audio.duration, 2),
         elapsed_s=round(time.time() - started, 3),
         models={k: v.as_dict() for k, v in scored.items()},

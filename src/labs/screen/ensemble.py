@@ -25,6 +25,20 @@ which model dissented tells you which failure mode you are in:
                    HUMAN track. Suspicious in the other direction.
 
 A max() throws that distinction away and reports both cases identically.
+
+WHY THE AGREEMENT BONUS RAMPS INSTEAD OF SWITCHING
+--------------------------------------------------
+The agreement bonus used to be applied as a step: the moment both detectors
+crossed 0.6 the fused score was multiplied by 1.08 and the confidence
+multiplier jumped from 0.55 to 1.15. That made the published score
+DISCONTINUOUS at the band edge - two detectors at 0.599/0.600 fused to 0.600,
+and at 0.600/0.600 to 0.648, for an input difference of one thousandth. A
+number with a cliff in it cannot be thresholded or compared: whichever side of
+the cliff a track lands on is an artifact of the band edge, not of the audio.
+
+Both the bonus and the multiplier now ramp from zero at the band edge to full
+at saturation, so the edge is a point where nothing happens rather than a step.
+Inside the disagreement region the behaviour is unchanged.
 """
 from __future__ import annotations
 
@@ -39,12 +53,30 @@ DISAGREE = "disagree"
 SINGLE = "single"
 
 
+def _ramp(value: float, start: float, end: float) -> float:
+    """0.0 at `start`, 1.0 at `end`, linear between, clamped outside.
+
+    `end` may be below `start` (the human side ramps from 0.4 down to 0.0).
+    """
+    if end == start:
+        return 1.0
+    return max(0.0, min(1.0, (value - start) / (end - start)))
+
+
+def _lerp(a: float, b: float, t: float) -> float:
+    return a + (b - a) * t
+
+
 @dataclass
 class EnsembleResult:
     available: bool
     probability: Optional[float] = None
     agreement: str = ""
     agreement_score: float = 0.0      # 1.0 identical, 0.0 opposite
+    # How far past the band edge the WEAKER detector sits: 0.0 exactly at the
+    # edge, 1.0 at saturation. This is what sizes the bonus, and publishing it
+    # is what makes the fused score auditable rather than just asserted.
+    agreement_strength: float = 0.0
     models: Dict[str, Optional[float]] = field(default_factory=dict)
     interpretation: str = ""
     confidence_multiplier: float = 1.0
@@ -83,21 +115,35 @@ def combine(scores: Dict[str, Any], cfg: ScreenConfig) -> EnsembleResult:
     fused = cfg.fakeprint_weight * p_fp + cfg.cnn_weight * p_cp
 
     if p_fp >= hi and p_cp >= hi:
+        # Ramped on the WEAKER of the two: a pair at 0.99/0.61 has one detector
+        # barely inside the band, and that is the one that should size the
+        # bonus. Taking the mean or the stronger score would let a saturated
+        # detector drag a hesitant one across the line.
+        strength = _ramp(min(p_fp, p_cp), hi, 1.0)
         return EnsembleResult(
             available=True,
-            probability=round(min(1.0, fused * cfg.agreement_boost), 4),
+            probability=round(min(1.0, fused * _lerp(1.0, cfg.agreement_boost,
+                                                     strength)), 4),
             agreement=AGREE_AI, agreement_score=agreement_score, models=models,
-            confidence_multiplier=cfg.agreement_confidence,
+            agreement_strength=round(strength, 4),
+            confidence_multiplier=round(_lerp(cfg.disagreement_confidence,
+                                              cfg.agreement_confidence,
+                                              strength), 4),
             interpretation="both detectors agree on AI origin",
             note="The spectral comb and the learned CQT texture both indicate "
                  "generation. Two independent representations, one conclusion.")
 
     if p_fp <= lo and p_cp <= lo:
+        strength = _ramp(max(p_fp, p_cp), lo, 0.0)
         return EnsembleResult(
             available=True,
-            probability=round(max(0.0, fused / cfg.agreement_boost), 4),
+            probability=round(max(0.0, fused / _lerp(1.0, cfg.agreement_boost,
+                                                     strength)), 4),
             agreement=AGREE_HUMAN, agreement_score=agreement_score,
-            models=models, confidence_multiplier=cfg.agreement_confidence,
+            models=models, agreement_strength=round(strength, 4),
+            confidence_multiplier=round(_lerp(cfg.disagreement_confidence,
+                                              cfg.agreement_confidence,
+                                              strength), 4),
             interpretation="both detectors agree on human origin",
             note="Neither the comb nor the texture shows generation artifacts.")
 

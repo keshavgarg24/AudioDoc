@@ -67,6 +67,8 @@ if aws s3 ls "s3://$BUCKET/$S3_PREFIX/Stage-1.ckpt" >/dev/null 2>&1 \
     done
     SHA1=$(shasum -a 256 "$CKPT_DIR/Stage-1.ckpt" | cut -d' ' -f1)
     SHA2=$(shasum -a 256 "$CKPT_DIR/Stage-2.ckpt" | cut -d' ' -f1)
+    tfvar_set "$WEIGHTS_TFVARS" stage1_sha256 "\"$SHA1\""
+    tfvar_set "$WEIGHTS_TFVARS" stage2_sha256 "\"$SHA2\""
     cat > "$AWS_DIR/.weights-digests" <<EOF
 LABS_STAGE1_SHA256=$SHA1
 LABS_STAGE2_SHA256=$SHA2
@@ -168,11 +170,15 @@ info "Stage-1 ${SHA1:0:16}..."
 info "Stage-2 ${SHA2:0:16}..."
 
 tfvar_set "$WEIGHTS_TFVARS" weights_s3_uri "\"$S3_URI\""
+# The module exposes these, so they travel into the task definition as
+# LABS_STAGE1_SHA256 / LABS_STAGE2_SHA256 and the application verifies what it
+# loaded. Writing them only to .weights-digests - as this script used to -
+# meant the pin was computed, displayed, and then thrown away.
+tfvar_set "$WEIGHTS_TFVARS" stage1_sha256 "\"$SHA1\""
+tfvar_set "$WEIGHTS_TFVARS" stage2_sha256 "\"$SHA2\""
 
-# Not a tfvars entry: these are consumed by the containers as env vars, and
-# the task definition reads them from stack.auto.tfvars via Terraform only if
-# the module exposes them. Recorded here so 05-apply.sh can pass them and so
-# a human can see what was pinned.
+# Also written in env form, for a human reading the directory and for any
+# out-of-band check that wants to compare against the bucket.
 cat > "$AWS_DIR/.weights-digests" <<EOF
 LABS_STAGE1_SHA256=$SHA1
 LABS_STAGE2_SHA256=$SHA2

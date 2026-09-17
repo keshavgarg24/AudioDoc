@@ -322,6 +322,10 @@ class DeepPolicyConfig:
         _env("LABS_INCONCLUSIVE_BELOW", "2.0")))
     enabled: bool = field(default_factory=lambda: _env_bool(
         "LABS_DEEP_BANDING", True))
+    # Mirrors ScreenConfig.uncertain_margin so `assessment.band` means the same
+    # thing whichever tier answered. Reporting only; never gates a verdict.
+    uncertain_margin: float = field(default_factory=lambda: float(
+        _env("LABS_UNCERTAIN_MARGIN", "0.15")))
 
 
 @dataclass(frozen=True)
@@ -415,6 +419,13 @@ class ScreenConfig:
         _env("LABS_SCREEN_HUMAN_THRESHOLD", "0.20")))
     min_confidence: float = field(default_factory=lambda: float(
         _env("LABS_SCREEN_MIN_CONFIDENCE", "0.45")))
+    # Half-width of the `uncertain` band around 0.5 in `assessment.band`.
+    # Purely a reporting tag - it never changes `verdict`, and it never
+    # suppresses `label`. 0.15 puts the boundary at 0.35/0.65, which is where
+    # the fused score stops being dominated by whichever detector happened to
+    # be louder. Shared with the deep tier so one legend fits both.
+    uncertain_margin: float = field(default_factory=lambda: float(
+        _env("LABS_UNCERTAIN_MARGIN", "0.15")))
 
     # -- early exit -------------------------------------------------------
     # When Level 1 is certain a track is AI, Level 2 cannot change the verdict,

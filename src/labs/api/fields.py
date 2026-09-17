@@ -16,12 +16,18 @@ from typing import Dict, FrozenSet, Set
 # Always present, whatever was asked for, so a narrowed response is still
 # self-describing: what mode produced it, where it came from, how long it took
 # and which build answered.
+#
+# `assessment` is here rather than in the `verdict` group because it is the
+# envelope that makes a narrowed response interpretable at all: a caller who
+# asked only for `musical` still needs to know what the service concluded, and
+# it is four scalars, not a payload worth trimming.
 ALWAYS_FIELDS: FrozenSet[str] = frozenset(
-    {"mode", "source", "runtime", "model"})
+    {"mode", "source", "runtime", "model", "assessment", "verdict"})
 
 FIELD_GROUPS: Dict[str, Set[str]] = {
     "verdict": {"prediction", "confidence", "raw_logit", "fake_probability",
-                "real_probability", "summary"},
+                "real_probability", "summary", "assessment", "verdict",
+                "band_note", "decisive"},
     "reliability": {"reliability"},
     "timeline": {"timeline"},
     "structure": {"structure"},

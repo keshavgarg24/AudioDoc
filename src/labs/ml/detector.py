@@ -13,6 +13,8 @@ from typing import Dict, List, Optional
 import torch
 
 from ..analysis.audio import load_segments, validate
+from ..assessment import build as build_assessment
+from ..assessment import confidence_for
 from ..analysis.features import extract as extract_features
 from ..analysis.musical import analyse as analyse_musical
 from ..analysis.production import analyse as analyse_production
@@ -68,6 +70,23 @@ def _band(raw_logit: float, cfg) -> Dict:
         "band_note": (f"|logit| {abs(raw_logit):.2f} is clear of the "
                       f"{cfg.inconclusive_below} inconclusive band."),
     }
+
+
+def _decisive_bounds(cfg) -> tuple:
+    """Where `inconclusive_below` sits in probability space, both sides.
+
+    The band is defined on the logit, but `assessment.band` grades the score,
+    so the same cutoff has to be expressed in both. Pushing the configured
+    logit threshold through the SAME sigmoid the score uses - rather than
+    hardcoding 0.88 - is what stops `band` and `verdict` from disagreeing when
+    an operator retunes `LABS_INCONCLUSIVE_BELOW` or the sigmoid shape.
+    """
+    t = float(cfg.deep_policy.inconclusive_below)
+    kw = {"scale_factor": cfg.model.sigmoid_scale_factor,
+          "linear_property": cfg.model.sigmoid_linear_property}
+    ai = float(scaled_sigmoid(torch.tensor(t), **kw).item())
+    human = float(scaled_sigmoid(torch.tensor(-t), **kw).item())
+    return ai, human
 
 
 def _pad_sequence(embedding: torch.Tensor, length: int) -> torch.Tensor:
@@ -438,7 +457,13 @@ class Detector:
             raw = float(logit.item())
             verdict = {
                 # Preserved verbatim for existing callers: a hard side of zero.
+                # `assessment.label` is the maintained spelling of the same
+                # call, in the shared vocabulary and present on both tiers.
                 "prediction": "Fake" if prob > 0.5 else "Real",
+                # Legacy scale: max(p, 1-p) * 100, so its floor is 50 even for
+                # a track sitting exactly on the boundary. Kept because the
+                # report and the existing frontend read it.
+                # `assessment.confidence` is the one with a sane zero.
                 "confidence": round(max(prob, 1 - prob) * 100, 2),
                 "fake_probability": round(prob, 4),
                 "real_probability": round(1 - prob, 4),
@@ -448,6 +473,22 @@ class Detector:
                 "cascade": cascade_info,
             }
             verdict.update(_band(raw, cfg.deep_policy))
+
+            ai_decisive, human_decisive = _decisive_bounds(cfg)
+            verdict["assessment"] = build_assessment(
+                score=prob,
+                verdict=verdict["verdict"],
+                # Multiplier 1.0: unlike Level 1, this tier has no second
+                # opinion to weigh the score against. The cascade re-scores at
+                # full density whenever the first pass lands inside the
+                # sensitive region, so `prob` is already the tier's best
+                # estimate rather than one needing a discount.
+                confidence=confidence_for(prob),
+                decided_by="level_2_deep",
+                ai_decisive=ai_decisive,
+                human_decisive=human_decisive,
+                uncertain_margin=cfg.deep_policy.uncertain_margin,
+                note=verdict.get("band_note", ""))
 
         features, musical_data, production_data = {}, {}, {}
         cache = None

@@ -19,6 +19,7 @@ Interactive documentation is served at `/docs`, the OpenAPI schema at
 - [Authentication](#authentication)
 - [Rate limits](#rate-limits)
 - [The two tiers](#the-two-tiers)
+- [**`assessment` — read this one**](#assessment--read-this-one)
 - [Screen (Level 1, free)](#screen-level-1-free)
 - [Analyses](#analyses)
 - [Appeals and feedback](#appeals-and-feedback)
@@ -150,6 +151,88 @@ exoneration on its own.
 
 ---
 
+## `assessment` — read this one
+
+Every detection response carries an `assessment` block, in the same shape, from
+whichever tier answered. **This is the block to integrate against.** The
+top-level `prediction`, `confidence`, `fake_probability` and `real_probability`
+fields are kept for older callers and documented below, but they do not mean
+the same thing across the two tiers and `assessment` does.
+
+```json
+"assessment": {
+  "score": 0.8005,
+  "label": "ai-generated",
+  "verdict": "inconclusive",
+  "band": "likely-ai",
+  "confidence": 0.601,
+  "margin": 0.3005,
+  "threshold": 0.5,
+  "decided_by": "level_2_deep"
+}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `score` | 0–1 | P(AI-generated). **0.5 is the decision boundary.** `null` only when no model could score the file. |
+| `label` | string | `score >= 0.5 → ai-generated`, else `human-made`. **Always populated.** Never `inconclusive`. |
+| `verdict` | string | The same score after an uncertainty band. May be `inconclusive` or `unavailable`. |
+| `band` | string | `strong-ai` · `likely-ai` · `uncertain` · `likely-human` · `strong-human`. |
+| `confidence` | 0–1 | `\|score − 0.5\| × 2`, times the tier's reliability evidence. **0.0 means "on the boundary"**, not "half sure". |
+| `margin` | 0–0.5 | Raw distance from the boundary, before any multiplier. |
+| `threshold` | 0.5 | Stated in the payload so it is never inferred. |
+| `decided_by` | string | `level_1_policy`, `level_1_c2pa`, `level_2_deep`, … |
+
+### Which field should you use?
+
+`label` and `verdict` answer different questions and the service publishes
+both on purpose.
+
+| You are… | Use | Because |
+|---|---|---|
+| Ranking a catalogue, or feeding a review queue | `label` + `band` | You need a side for every row, and `band` tells you which rows deserve a human minute. |
+| Taking an action with a cost — delisting, refusing a payout, emailing a producer | `verdict` | It abstains rather than guess, and a wrong call here is expensive. |
+| Building your own threshold | `score` | It is monotone and continuous. Set your own cutoff. |
+
+Rounding a coin flip to the nearer side and publishing it as a finding is how a
+detector acquires a false-accusation rate it cannot see. Refusing to answer at
+all is useless to someone running bulk triage. Both are reported, from the same
+number, and you pick by what being wrong costs you.
+
+### Why `label` and `verdict` can disagree
+
+They disagree exactly when the score is real but not strong enough to clear the
+tier's own bar. A track at `score = 0.80` from Level 2 gets
+`label: ai-generated` and `verdict: inconclusive`, because Level 2's decisive
+point is 0.88. Nothing is contradictory: one field is reporting the side, the
+other is reporting whether the side is safe to act on.
+
+| Tier | AI decisive at | Human decisive at |
+|---|---|---|
+| Level 1 | `score ≥ 0.80` | `score ≤ 0.20` |
+| Level 2 | `score ≥ 0.8808` (`\|logit\| ≥ 2`) | `score ≤ 0.1192` |
+
+### Cross-tier agreement
+
+When both tiers run, `detection.level_agreement` reports whether they concur:
+
+```json
+"level_agreement": {
+  "state": "disagree",
+  "note": "The deep model flags this track and Level 1 does not...",
+  "labels": {"level_1": "human-made", "level_2": "ai-generated", "match": false,
+             "note": "The tiers fall on opposite sides of 0.5..."}
+}
+```
+
+`state` compares the banded verdicts and can be `level-1-inconclusive` or
+`level-2-inconclusive`, which tells you nothing about which way each was
+leaning. `labels` always compares, because `label` always exists. **Two tiers
+on opposite sides of 0.5 is the single most useful thing to sort a review queue
+on**, whether or not either cleared its own bar.
+
+---
+
 ## Screen (Level 1, free)
 
 ### `POST /v1/screen`
@@ -174,6 +257,16 @@ curl -s -F file=@track.mp3 https://api.example.com/v1/screen | jq
 {
   "tier": "screen",
   "levels_run": ["level_1_screen"],
+  "assessment": {
+    "score": 0.0007,
+    "label": "human-made",
+    "verdict": "human-made",
+    "band": "strong-human",
+    "confidence": 0.9986,
+    "margin": 0.4993,
+    "threshold": 0.5,
+    "decided_by": "level_1_policy"
+  },
   "verdict": "human-made",
   "prediction": "Real",
   "fake_probability": 0.0007,

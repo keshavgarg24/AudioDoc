@@ -39,13 +39,13 @@ make_subnet() {
   local tag="$STACK_NAME-$suffix" id
   id=$(find_by_tag subnets "$tag" 'Subnets[0].SubnetId')
   if [[ -n "$id" ]]; then
-    reuse "subnet $tag = $id" >&2
+    reuse "subnet $tag = $id"
   else
     id=$(aws ec2 create-subnet --vpc-id "$VPC_ID" --cidr-block "$cidr" \
       --availability-zone "$az" \
       --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=$tag},{Key=Tier,Value=$tier}]" \
       --query Subnet.SubnetId --output text)
-    ok "subnet $tag = $id ($cidr, $az)" >&2
+    ok "subnet $tag = $id ($cidr, $az)"
   fi
   printf '%s' "$id"
 }
@@ -80,23 +80,12 @@ NAT=$(aws ec2 describe-nat-gateways \
 if [[ "$NAT" != "None" && -n "$NAT" ]]; then
   reuse "NAT gateway $NAT"
 else
-  # Reuse an EIP from a previous partial run if one was already tagged, so we
-  # do not accumulate unattached EIPs (each bills $0.005/hr while unused).
-  EIP=$(aws ec2 describe-addresses \
-    --filters "Name=tag:Name,Values=$STACK_NAME-nat-eip" \
-    --query 'Addresses[0].AllocationId' --output text 2>/dev/null || true)
-  if [[ "$EIP" == "None" || -z "$EIP" ]]; then
-    EIP=$(aws ec2 allocate-address --domain vpc --query AllocationId --output text)
-    aws ec2 create-tags --resources "$EIP" --tags "Key=Name,Value=$STACK_NAME-nat-eip"
-    ok "elastic IP $EIP"
-  else
-    reuse "elastic IP $EIP"
-  fi
-  # Use create-tags separately instead of --tag-specifications to avoid an
-  # InvalidCharacter XML error in some AWS CLI versions.
+  EIP=$(aws ec2 allocate-address --domain vpc \
+    --tag-specifications "ResourceType=elastic-ip,Tags=[{Key=Name,Value=$STACK_NAME-nat-eip}]" \
+    --query AllocationId --output text)
   NAT=$(aws ec2 create-nat-gateway --subnet-id "$PUB_A" --allocation-id "$EIP" \
+    --tag-specifications "ResourceType=natgateway,Tags=[{Key=Name,Value=$STACK_NAME-nat}]" \
     --query NatGateway.NatGatewayId --output text)
-  aws ec2 create-tags --resources "$NAT" --tags "Key=Name,Value=$STACK_NAME-nat"
   info "waiting for NAT $NAT (about 2 minutes)..."
   aws ec2 wait nat-gateway-available --nat-gateway-ids "$NAT"
   ok "NAT gateway $NAT"

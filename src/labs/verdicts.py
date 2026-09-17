@@ -20,6 +20,19 @@ VERDICT_UNAVAILABLE = "unavailable"
 
 VERDICTS = (VERDICT_AI, VERDICT_HUMAN, VERDICT_INCONCLUSIVE, VERDICT_UNAVAILABLE)
 
+# How strong the answer is, independent of whether it cleared the bar for a
+# verdict. A queue sorted by `band` puts the tracks worth a human minute at the
+# top; a queue sorted by `verdict` cannot, because `inconclusive` covers both
+# "almost certainly generated but one detector dissented" and "no idea".
+BAND_STRONG_AI = "strong-ai"
+BAND_LIKELY_AI = "likely-ai"
+BAND_UNCERTAIN = "uncertain"
+BAND_LIKELY_HUMAN = "likely-human"
+BAND_STRONG_HUMAN = "strong-human"
+
+BANDS = (BAND_STRONG_AI, BAND_LIKELY_AI, BAND_UNCERTAIN,
+         BAND_LIKELY_HUMAN, BAND_STRONG_HUMAN)
+
 # What should happen next. Level 1 emits these; the tier orchestrator acts on
 # them. `return` is a claim that a deeper pass could not change the answer, so
 # it is only ever set for a decisive AI verdict that survived the exit gate.

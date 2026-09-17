@@ -315,6 +315,20 @@ class MongoStore:
                         minPoolSize=2,
                         waitQueueTimeoutMS=5000,
                         retryWrites=True,
+                        # Read from the primary, not from a secondary.
+                        #
+                        # On a replica set the default lets a read land on a
+                        # lagging secondary, and job status is the one thing
+                        # that cannot tolerate it: a client polling
+                        # GET /v1/analyses/{id} can be told `succeeded` and
+                        # then `queued` on the next request, because the two
+                        # reads hit different members. Callers reasonably treat
+                        # that as the job restarting.
+                        #
+                        # These are small, indexed, single-document reads on a
+                        # low-traffic collection, so there is nothing to gain
+                        # from spreading them and a correctness bug to lose.
+                        readPreference="primary",
                         appname="labs-api",
                     )
                     self._db = client[self.cfg.mongo_db]
@@ -694,11 +708,21 @@ class MongoStore:
             return None
 
     def find_report_by_hash(self, sha256: str,
-                            mode: Optional[str] = None) -> Optional[Dict]:
+                            mode: Optional[str] = None,
+                            api_key_id: Optional[str] = None) -> Optional[Dict]:
         """The full stored report for previously analysed audio.
 
         Separate from find_by_hash because that one deliberately excludes the
         compressed blob for listing purposes, and a dedup hit needs it.
+
+        `api_key_id` scopes the lookup to one caller and is REQUIRED for the
+        dedup cache. Without it the hash is a global lookup key: anyone holding
+        bytes that someone else already analysed gets their stored report back
+        in full, which is a cross-tenant disclosure rather than a cache hit. It
+        also breaks the caller, because the `_id` returned belongs to the other
+        key's job and every later poll of it fails the ownership check in
+        `get_analysis` with a 404 - the job looks permanently stuck even though
+        the analysis succeeded for its actual owner.
         """
         if not self.enabled:
             return None
@@ -706,6 +730,8 @@ class MongoStore:
             q: Dict = {"audio.sha256": sha256}
             if mode:
                 q["mode"] = mode
+            if api_key_id:
+                q["api_key_id"] = api_key_id
             doc = self.db().analyses.find_one(q, sort=[("created_at", -1)])
             if not doc:
                 return None

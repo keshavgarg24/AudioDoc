@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
+from ..assessment import confidence_for
 from ..core.config import ScreenConfig
 from ..verdicts import (
     NEXT_ESCALATE,
@@ -26,7 +27,7 @@ from ..verdicts import (
 )
 from .ensemble import AGREE_AI, DISAGREE, SINGLE
 
-__all__ = ["decide", "ScreenDecision", "NEXT_RETURN", "NEXT_ESCALATE",
+__all__ = ["decide", "reband", "ScreenDecision", "NEXT_RETURN", "NEXT_ESCALATE",
            "VERDICT_AI", "VERDICT_HUMAN", "VERDICT_INCONCLUSIVE",
            "VERDICT_UNAVAILABLE"]
 
@@ -71,7 +72,9 @@ def decide(*, ensemble, c2pa, container, bandwidth,
             review_recommended=True)
 
     score = float(ensemble.probability)
-    confidence = min(abs(score - 0.5) * 2.0, 1.0) * ensemble.confidence_multiplier
+    # One definition of confidence for both tiers; see assessment.py. Level 1's
+    # reliability evidence is detector agreement, which arrives as a multiplier.
+    confidence = confidence_for(score, ensemble.confidence_multiplier)
 
     if ensemble.agreement == AGREE_AI:
         reasons.append("both detectors agree on AI origin (spectral comb and "
@@ -132,3 +135,38 @@ def decide(*, ensemble, c2pa, container, bandwidth,
                "an artifact it recognises. Both know only the generators they "
                "were trained on; neither can rule out one it has never seen. "
                "Use the deep tier for an exoneration.")
+
+
+def reband(decision: ScreenDecision, cfg: ScreenConfig) -> ScreenDecision:
+    """Re-apply the confidence gate after something outside `decide` moved it.
+
+    WHY THIS IS NEEDED
+    ------------------
+    `decide` bands on a confidence it computes itself, but the robustness gate
+    in `pipeline.run` runs AFTERWARDS and can multiply that confidence down -
+    it is the only evidence that arrives too late to be an input, because it
+    costs three extra model passes and is therefore only bought for tracks
+    about to skip Level 2.
+
+    Applying that penalty without re-banding left the verdict standing on a
+    confidence that no longer cleared the bar which produced it. Measured on
+    ai1.mp3: `ai-generated` published at confidence 0.231 against a
+    `min_confidence` of 0.45. The number and the verdict disagreed, and the
+    number was the honest one.
+
+    Mutates in place and returns the same object, because the caller is holding
+    the only reference and a copy here would just have to be assigned back.
+    """
+    if decision.verdict not in (VERDICT_AI, VERDICT_HUMAN):
+        return decision
+    if decision.confidence >= cfg.min_confidence:
+        return decision
+
+    decision.verdict = VERDICT_INCONCLUSIVE
+    decision.review_recommended = True
+    decision.reasons.append(
+        f"confidence fell to {decision.confidence:.3f} after the robustness "
+        f"penalty, below the {cfg.min_confidence} this tier requires before it "
+        f"will publish a verdict; the score itself is unchanged and is "
+        f"reported in `probability`")
+    return decision

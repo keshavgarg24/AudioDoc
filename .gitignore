@@ -29,7 +29,11 @@ __pycache__/
 build/
 dist/
 .venv/
+.venv-*/
 venv/
+# Benchmark output: raw JSON per run plus the rendered PDF. Reproducible from
+# scripts/aws_benchmark.py given the same --seed, so it is not worth versioning.
+benchmarks/
 env/
 
 # Tooling
@@ -69,6 +73,9 @@ tfplan
 # and secret ARNs for whichever stack was last deployed from this checkout,
 # which is per-machine state rather than anything to share.
 deploy/aws/*.auto.tfvars
+# Written by 00-backend.sh. The bucket name embeds the account id, so this is
+# per-account config rather than something to commit.
+deploy/aws/backend.hcl
 deploy/aws/.weights-digests
 
 # Editors and OS
@@ -76,3 +83,6 @@ deploy/aws/.weights-digests
 .idea/
 *.swp
 .DS_Store
+
+# Terraform plan files embed variable values, including secrets.
+tfplan-*

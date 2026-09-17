@@ -34,31 +34,14 @@ done
 # key revocable without a redeploy. It is printed once and stored only as a
 # SHA-256 hash, so there is no way to recover it later.
 step "Issuing an API key"
-ACCOUNT_ID=$(aws_account_id)
-WORKER_IMAGE="$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$STACK_NAME-worker:$IMAGE_TAG"
-MONGO_SECRET_ID="$STACK_NAME/mongo-uri"
-MONGO_URI=$(aws secretsmanager get-secret-value --secret-id "$MONGO_SECRET_ID" \
-  --query SecretString --output text)
-
-KEY_OUTPUT=$(docker run --rm --platform linux/amd64 \
-  -e LABS_MONGO_URI="$MONGO_URI" "$WORKER_IMAGE" \
-  python -m labs.cli.manage_keys create \
-  --name "smoke-test" --scopes screen,analyze,deep,read 2>&1) \
-  || die "could not create an API key:
-$KEY_OUTPUT"
-
-# Parse the "key" line specifically rather than pattern-matching the whole
-# output. The command also prints a FINGERPRINT, which shares the
-# `labs_live_` prefix and would match any loose regex - and a fingerprint
-# authenticates nothing, so the smoke test would fail later with a confusing
-# 401 rather than here with a clear parse error.
-API_KEY=$(printf '%s' "$KEY_OUTPUT" | awk '$1 == "key" { print $2; exit }')
-[[ -n "$API_KEY" ]] || die "key created but could not be parsed from:
-$KEY_OUTPUT"
+# Runs the CLI inside the VPC as a one-off ECS task rather than locally; see
+# issue_api_key in lib.sh for why a local `docker run` cannot reach Atlas.
+API_KEY=$(issue_api_key "smoke-test-$(date +%Y%m%d-%H%M%S)") \
+  || die "could not create an API key"
+[[ -n "$API_KEY" ]] || die "key task succeeded but no key could be parsed from its log"
 # labs_live_ + 43 url-safe characters. A fingerprint is the prefix plus 6.
 [[ ${#API_KEY} -gt 30 ]] || die "parsed '$API_KEY', which is too short to be a key
-    (it is most likely the fingerprint). Full output:
-$KEY_OUTPUT"
+    (it is most likely the fingerprint)."
 ok "API key issued (shown once, stored as a hash)"
 
 # ----------------------------------------------------------------- readiness
@@ -73,7 +56,7 @@ if [[ -z "$SAMPLE" ]]; then
 else
   curl -fsS -X POST "$BASE/v1/screen" -H "X-API-Key: $API_KEY" \
     -F "file=@$SAMPLE" \
-    | python3 -c 'import sys,json; d=json.load(sys.stdin); print("    verdict={} next_step={} elapsed={}s".format(d.get("verdict"),d.get("next_step"),d.get("elapsed_s")))' \
+    | python3 -c 'import sys,json; d=json.load(sys.stdin); print(f"    verdict={d.get(\"verdict\")} next_step={d.get(\"next_step\")} elapsed={d.get(\"elapsed_s\")}s")' \
     || die "Level 1 failed. The ONNX weights ship in the image, so a failure
     here is the image itself rather than anything in S3."
   ok "Level 1 answered"

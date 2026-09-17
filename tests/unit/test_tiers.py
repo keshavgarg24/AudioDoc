@@ -250,6 +250,16 @@ class TestLevelAgreement:
 
     def test_disagreement_is_recorded_not_resolved(self, settings, patched):
         """No field here collapses the two levels into one number: the levels
-        read different things, so a disagreement is a fact about the track."""
+        read different things, so a disagreement is a fact about the track.
+
+        `labels` reports each tier's own side of 0.5 and whether they match. It
+        is a comparison, not a fusion - there is deliberately no combined score
+        or tie-break anywhere in this block, and that absence is the test.
+        """
         a = self._run(settings, patched, policy.VERDICT_AI, "human-made")
-        assert set(a) == {"state", "note"}
+        assert set(a) == {"state", "note", "labels"}
+        assert set(a["labels"]) == {"level_1", "level_2", "match", "note"}
+        # Nothing here may be a fused verdict, score or probability.
+        assert not {"score", "probability", "fused", "combined",
+                    "resolved"} & set(a)
+        assert not {"score", "probability", "fused"} & set(a["labels"])

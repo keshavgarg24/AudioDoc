@@ -37,7 +37,28 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.5"
+    }
   }
+
+  # State lives in S3, configured by `terraform init -backend-config=...` from
+  # 00-backend.sh rather than hardcoded here, because the bucket name has to be
+  # account-unique and this file is committed.
+  #
+  # WHY THIS IS NOT OPTIONAL
+  # ------------------------
+  # With local state, the only record of what exists in AWS is one file on one
+  # laptop. Delete the directory and the stack is still running, still billing,
+  # and no longer manageable by Terraform - every resource has to be imported
+  # by hand or found and deleted in the console. This stack was in exactly that
+  # position: state lived in an untracked sibling directory, and the deploy
+  # fixes lived only there too.
+  #
+  # An S3 bucket with versioning plus a DynamoDB lock table is inside the
+  # always-free tier at this size.
+  backend "s3" {}
 }
 
 # Pinned to var.region explicitly.
@@ -179,9 +200,111 @@ variable "audio_prefix" {
 # two worker tasks comfortably, or one with headroom for the DSP passes.
 variable "worker_instance_type" { default = "c7g.2xlarge" }
 
+variable "worker_task_cpu" {
+  default     = 4096
+  description = <<-EOT
+    CPU units per worker task. Must leave headroom on the host: the ECS agent
+    and the container runtime take roughly 128 units and 256 MiB, so a task
+    sized to the instance's full vCPU count will never be placed.
+
+      c7g.2xlarge  (8 vCPU / 16 GiB)  ->  4096 / 8192, two tasks per host
+      m7i-flex.large (2 vCPU / 8 GiB) ->  2048 / 6144, one task per host
+  EOT
+}
+
+variable "worker_task_memory" {
+  default     = 8192
+  description = "MiB per worker task. The backbone holds ~3.5 GB resident and the DSP passes peak above that on a long track."
+}
+
+variable "worker_torch_threads" {
+  default     = 4
+  description = <<-EOT
+    Torch intra-op threads. PHYSICAL cores, not vCPUs.
+
+    Graviton has no SMT so the two are equal there. On x86 the right value is
+    half the vCPU count: two hyperthreads sharing one core's vector units
+    contend rather than scale, and setting this to the vCPU count costs
+    throughput instead of buying it.
+  EOT
+}
+
+variable "enable_cloudfront" {
+  default     = true
+  description = <<-EOT
+    Put a CloudFront distribution in front of the ALB to get HTTPS without
+    owning a domain.
+
+    The `*.cloudfront.net` certificate is issued and rotated by AWS and costs
+    nothing; CloudFront's always-free tier covers 1 TB/month of egress and 10M
+    requests. Without this, and without an ACM `certificate_arn`, the ALB
+    serves plain HTTP and every API key crosses the internet in the clear.
+
+    Adds ~10 minutes to the first apply while the distribution propagates.
+  EOT
+}
+
+variable "lock_alb_to_cloudfront" {
+  default     = false
+  description = <<-EOT
+    Make the ALB refuse any request that did not come through CloudFront, by
+    requiring the secret header the distribution injects.
+
+    Off by default because turning it on breaks every existing caller that
+    holds the ALB hostname - including 06-verify.sh. Turn it on once traffic
+    has moved to the distribution URL, otherwise the HTTPS front door is
+    advisory: anyone with the ALB hostname can still reach port 80 directly.
+  EOT
+}
+
+variable "stage1_sha256" {
+  default     = ""
+  description = <<-EOT
+    SHA-256 of Stage-1.ckpt, as uploaded to the weights mirror. Empty disables
+    verification and the application logs a warning every boot.
+
+    Written automatically by 03-weights.sh. Set it by hand only when attaching
+    to a mirror this stack did not populate.
+  EOT
+}
+
+variable "stage2_sha256" {
+  default     = ""
+  description = "SHA-256 of Stage-2.ckpt. See stage1_sha256."
+}
+
+variable "uncertain_margin" {
+  default     = 0.15
+  description = <<-EOT
+    Half-width of the `uncertain` band around the 0.5 decision boundary in
+    `assessment.band`. Shared by both tiers so one legend fits both.
+
+    Reporting only: it never changes `verdict` and never suppresses `label`.
+  EOT
+}
+
+variable "busybox_image" {
+  # Pinned by digest, not by tag. `:latest` would mean the task definition
+  # silently changes what it runs whenever upstream republishes, which is not
+  # something a forensic service should allow into its own boot path.
+  # Resolved from public.ecr.aws/docker/library/busybox:1.36.1.
+  default     = "public.ecr.aws/docker/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662"
+  description = "Init container that fixes host-volume ownership for the worker."
+}
+
 variable "worker_max_size" {
   default     = 20
   description = "Ceiling on the worker ASG. Also caps the warm pool's prepared capacity."
+}
+
+variable "worker_min_size" {
+  default     = 1
+  description = "Floor on the worker ASG. Raise to keep the fleet warm and avoid scale-in churn."
+}
+
+variable "worker_min_tasks" {
+  default     = 1
+  description = "Floor on worker ECS tasks. Set equal to worker_min_size to keep every instance busy."
 }
 
 variable "warm_pool_size" {
@@ -586,6 +709,12 @@ resource "aws_lb_target_group" "api" {
   tags                 = local.tags
 }
 
+locals {
+  # Both must be true: locking the origin without a distribution in front of it
+  # would refuse every request including the operator's own.
+  lock_origin = var.enable_cloudfront && var.lock_alb_to_cloudfront
+}
+
 resource "aws_lb_listener" "this" {
   load_balancer_arn = aws_lb.this.arn
   port              = var.certificate_arn == "" ? 80 : 443
@@ -593,9 +722,131 @@ resource "aws_lb_listener" "this" {
   ssl_policy        = var.certificate_arn == "" ? null : "ELBSecurityPolicy-TLS13-1-2-2021-06"
   certificate_arn   = var.certificate_arn == "" ? null : var.certificate_arn
 
-  default_action {
+  # Exactly one of these is rendered. Unlocked, the default forwards as it
+  # always has. Locked, the default refuses and the forward moves into
+  # `api_via_cloudfront`, which requires the distribution's secret header.
+  dynamic "default_action" {
+    for_each = local.lock_origin ? [] : [1]
+    content {
+      type             = "forward"
+      target_group_arn = aws_lb_target_group.api.arn
+    }
+  }
+
+  dynamic "default_action" {
+    for_each = local.lock_origin ? [1] : []
+    content {
+      type = "fixed-response"
+      fixed_response {
+        content_type = "application/json"
+        status_code  = "403"
+        message_body = jsonencode({
+          error  = "direct_origin_access_denied"
+          detail = "This origin does not serve traffic directly. Use the HTTPS endpoint."
+        })
+      }
+    }
+  }
+}
+
+###############################################################################
+# TLS without a domain
+#
+# An API key travelling over plaintext HTTP is readable by every hop between
+# the caller and the ALB. The usual fix is ACM, which needs a domain the
+# operator owns and can validate - so on a stack with no domain yet, TLS just
+# never got turned on.
+#
+# CloudFront closes that gap: its default `*.cloudfront.net` certificate is
+# issued and rotated by AWS, needs no domain, and costs nothing. The
+# distribution terminates TLS and forwards to the ALB.
+#
+# Set `certificate_arn` later and the ALB serves HTTPS directly; this
+# distribution is then redundant and can be disabled with enable_cloudfront.
+###############################################################################
+resource "aws_cloudfront_distribution" "this" {
+  count   = var.enable_cloudfront ? 1 : 0
+  enabled = true
+  comment = "${var.name} - TLS front door"
+  # PriceClass_100 is North America + Europe. The origin is in ap-south-1, so
+  # the edge is not buying latency here - it is buying a certificate. The
+  # cheapest class that still serves globally is the right one.
+  price_class = "PriceClass_100"
+
+  origin {
+    domain_name = aws_lb.this.dns_name
+    origin_id   = "alb"
+    custom_origin_config {
+      http_port  = 80
+      https_port = 443
+      # The ALB has no certificate of its own until `certificate_arn` is set,
+      # so the edge-to-origin leg is HTTP inside AWS's network. The
+      # caller-to-edge leg - the one crossing the public internet with an API
+      # key on it - is HTTPS either way.
+      origin_protocol_policy = "http-only"
+      origin_ssl_protocols   = ["TLSv1.2"]
+      origin_read_timeout    = 60
+    }
+    custom_header {
+      name  = "X-Origin-Verify"
+      value = random_password.origin_verify.result
+    }
+  }
+
+  default_cache_behavior {
+    target_origin_id       = "alb"
+    viewer_protocol_policy = "redirect-to-https"
+    allowed_methods        = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods         = ["GET", "HEAD"]
+    compress               = true
+    # CachingDisabled. Every response here is either an upload receipt or a
+    # verdict for one specific file; a cache hit would serve one caller another
+    # caller's analysis.
+    cache_policy_id = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+    # AllViewerExceptHostHeader - forwards Authorization and the rest, but lets
+    # the ALB see its own hostname so host-based routing still resolves.
+    origin_request_policy_id = "b689b0a8-53d0-40ab-baf2-68738e2966ac"
+  }
+
+  restrictions {
+    geo_restriction { restriction_type = "none" }
+  }
+
+  viewer_certificate {
+    cloudfront_default_certificate = true
+    minimum_protocol_version       = "TLSv1.2_2021"
+  }
+
+  tags = local.tags
+}
+
+# Lets the ALB tell edge traffic from someone who found the ALB hostname and
+# went around the distribution. Generated here rather than configured, because
+# it is a shared secret with no reason to be human-readable or reused.
+resource "random_password" "origin_verify" {
+  length  = 40
+  special = false
+}
+
+# An ALB rule matches requests that DO satisfy its condition; there is no
+# "unless". So the lock is expressed by inverting the DEFAULT instead: refuse
+# everything, and let a rule carrying the header forward. A request that
+# reached port 80 directly matches no rule, falls through to the default, and
+# is refused there - which is both correct and the cheapest place to say no.
+resource "aws_lb_listener_rule" "api_via_cloudfront" {
+  count        = local.lock_origin ? 1 : 0
+  listener_arn = aws_lb_listener.this.arn
+  priority     = 20
+
+  action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.api.arn
+  }
+  condition {
+    http_header {
+      http_header_name = "X-Origin-Verify"
+      values           = [random_password.origin_verify.result]
+    }
   }
 }
 
@@ -612,6 +863,20 @@ resource "aws_lb_listener_rule" "screen" {
   }
   condition {
     path_pattern { values = ["/v1/screen"] }
+  }
+
+  # Conditions on one rule are ANDed, so when the origin is locked this path
+  # needs the header too. Without it, /v1/screen would be the one route that
+  # still answered on plain HTTP - and it is the ungated public one, which
+  # makes it the worst possible exception.
+  dynamic "condition" {
+    for_each = local.lock_origin ? [1] : []
+    content {
+      http_header {
+        http_header_name = "X-Origin-Verify"
+        values           = [random_password.origin_verify.result]
+      }
+    }
   }
 }
 
@@ -649,6 +914,18 @@ locals {
     # above: a worker fetches from here or fails loudly, and never silently
     # pulls 1.3 GB from a third-party mirror mid-deploy.
     { name = "LABS_MODELS_S3_URI", value = var.weights_s3_uri },
+
+    # Verdict provenance. Without these the app logs a warning on every boot
+    # and accepts whatever bytes the mirror hands it - which means a verdict
+    # cannot be traced back to the exact weights that produced it, and a
+    # corrupted or swapped checkpoint is indistinguishable from a good one.
+    # Written by 03-weights.sh from the files it actually uploaded.
+    { name = "LABS_STAGE1_SHA256", value = var.stage1_sha256 },
+    { name = "LABS_STAGE2_SHA256", value = var.stage2_sha256 },
+
+    # Level 1 and Level 2 grade `assessment.band` against the same margin, so
+    # one legend fits both tiers. Reporting only - it never gates a verdict.
+    { name = "LABS_UNCERTAIN_MARGIN", value = tostring(var.uncertain_margin) },
   ]
 
   # Bucket ARN parsed out of the s3:// URI so the IAM policy can be scoped to
@@ -732,6 +1009,11 @@ resource "aws_ecs_task_definition" "screen" {
       # tighter budget.
       { name = "LABS_RATE_LIMIT_PER_MIN", value = "30" },
     ])
+    # The screen tier validates API keys against Mongo like every other tier.
+    # Omitting this block does not fail the deploy - the service starts, logs
+    # "running without persistence" once, and then 401s every authenticated
+    # request. It cost a day to find; that is why it is called out here.
+    secrets = local.mongo_secret
     logConfiguration = {
       logDriver = "awslogs"
       options = {
@@ -925,8 +1207,22 @@ resource "aws_appautoscaling_policy" "api" {
 ###############################################################################
 # Worker fleet: EC2 Graviton, scaled on queue backlog
 ###############################################################################
+# The AMI architecture has to match the instance family, and getting it wrong
+# fails late and opaquely: the instance boots, the ECS agent never registers,
+# and the service sits at 0/1 with no error pointing at the cause.
+#
+# Derived from the instance type rather than set by hand. Graviton families end
+# their size prefix in `g` (c7g, m7g, r8g); everything else is x86_64. Both the
+# task definition's `cpuArchitecture` and this parameter read the same local,
+# so they cannot drift apart.
+locals {
+  worker_family = split(".", var.worker_instance_type)[0]
+  worker_arch = can(regex("g[a-z]*$", local.worker_family)) ? "arm64" : "x86_64"
+  ecs_ami_path = local.worker_arch == "arm64" ? "arm64/recommended" : "recommended"
+}
+
 data "aws_ssm_parameter" "ecs_ami" {
-  name = "/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id"
+  name = "/aws/service/ecs/optimized-ami/amazon-linux-2023/${local.ecs_ami_path}/image_id"
 }
 
 resource "aws_launch_template" "worker" {
@@ -958,9 +1254,10 @@ resource "aws_launch_template" "worker" {
     # analysis the caller was told had been accepted.
     echo "ECS_ENABLE_SPOT_INSTANCE_DRAINING=true" >> /etc/ecs/ecs.config
     echo "ECS_CONTAINER_STOP_TIMEOUT=3m" >> /etc/ecs/ecs.config
-    # The worker runs as uid 10001 (labs). ECS creates host-path volume
-    # directories as root, so the container cannot write the checkpoint cache.
-    # Pre-create with the right ownership before the agent starts.
+    # Belt to the fix-perms init container's braces. This runs before the agent
+    # starts, so a warm-pool instance resuming with the weights already on its
+    # volume keeps the right ownership without waiting for a task placement.
+    # It is NOT sufficient alone - see the worker task definition for why.
     mkdir -p /opt/labs/models/checkpoints
     chown -R 10001:10001 /opt/labs/models
   EOT
@@ -975,9 +1272,9 @@ resource "aws_launch_template" "worker" {
 resource "aws_autoscaling_group" "worker" {
   name                = "${var.name}-worker"
   vpc_zone_identifier = var.private_subnet_ids
-  min_size            = 1
+  min_size            = var.worker_min_size
   max_size            = var.worker_max_size
-  desired_capacity    = 1
+  desired_capacity    = var.worker_min_size
 
   launch_template {
     id      = aws_launch_template.worker.id
@@ -1088,44 +1385,80 @@ resource "aws_ecs_task_definition" "worker" {
   family                   = "${var.name}-worker"
   requires_compatibilities = ["EC2"]
   network_mode             = "awsvpc"
-  # 2 vCPU / 6 GiB per task, sized for m7i-flex.large (2 vCPU, 8 GiB).
-  # The backbone wants ~3.5 GB resident; 6 GiB leaves room for the DSP peak.
-  cpu                = 2048
-  memory             = 6144
+  # Sized to the host, not to a constant: a c7g.2xlarge fits two 4096/8192
+  # tasks, an m7i-flex.large fits exactly one at 2048/6144. Overshooting the
+  # host fails as a task stuck in PROVISIONING with no placement, which reads
+  # like a capacity problem rather than a sizing one.
+  cpu                = var.worker_task_cpu
+  memory             = var.worker_task_memory
   execution_role_arn = aws_iam_role.execution.arn
   task_role_arn      = aws_iam_role.worker.arn
 
-  container_definitions = jsonencode([{
-    name      = "worker"
-    image     = "${local.ecr}-worker:${var.image_tag}"
-    essential = true
-    environment = concat(local.common_env, [
-      # ONE analysis per container, enforced by the worker loop itself rather
-      # than by a setting: the pipeline is CPU-bound, so two concurrent runs
-      # each go at half speed for identical throughput. Capacity comes from
-      # more containers; the variable below sizes the one container.
-      #
-      # x86 with HyperThreading: 2 vCPUs = 1 physical core + 1 HT thread.
-      # Setting threads to vCPU count (2) uses both HT threads for inference.
-      { name = "LABS_TORCH_THREADS", value = "2" },
-      { name = "OMP_NUM_THREADS", value = "2" },
-      { name = "LABS_EAGER_LOAD", value = "true" },
-    ])
-    logConfiguration = {
-      logDriver = "awslogs"
-      options = {
-        awslogs-group         = aws_cloudwatch_log_group.this.name
-        awslogs-region        = data.aws_region.current.name
-        awslogs-stream-prefix = "worker"
+  container_definitions = jsonencode([
+    # ECS creates host-path volume directories as root. The worker runs as uid
+    # 10001, so without this it cannot write the checkpoint cache into /models,
+    # falls back to downloading from HuggingFace, and dies because
+    # LABS_OFFLINE=true forbids exactly that.
+    #
+    # The equivalent chown in the launch template's user_data is NOT sufficient
+    # on its own: it races the ECS agent, which recreates the bind-mount source
+    # as root when it places the task. An init container cannot race, because
+    # `dependsOn: SUCCESS` makes the worker wait for its exit code.
+    {
+      name      = "fix-perms"
+      image     = var.busybox_image
+      essential = false
+      user      = "0"
+      command   = ["sh", "-c", "chown -R 10001:10001 /models && chmod 755 /models"]
+      mountPoints = [{
+        sourceVolume  = "models"
+        containerPath = "/models"
+        readOnly      = false
+      }]
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          awslogs-group         = aws_cloudwatch_log_group.this.name
+          awslogs-region        = data.aws_region.current.name
+          awslogs-stream-prefix = "fix-perms"
+        }
       }
+    },
+    {
+      name      = "worker"
+      image     = "${local.ecr}-worker:${var.image_tag}"
+      essential = true
+      dependsOn = [{ containerName = "fix-perms", condition = "SUCCESS" }]
+      environment = concat(local.common_env, [
+        # ONE analysis per container, enforced by the worker loop itself rather
+        # than by a setting: the pipeline is CPU-bound, so two concurrent runs
+        # each go at half speed for identical throughput. Capacity comes from
+        # more containers; the variable below sizes the one container.
+        #
+        # Physical cores, not vCPUs. Graviton has no SMT so these are equal
+        # there, which is another reason to prefer it for this workload - on
+        # x86 the right value is half the vCPU count and getting it wrong costs
+        # throughput to cache contention.
+        { name = "LABS_TORCH_THREADS", value = tostring(var.worker_torch_threads) },
+        { name = "OMP_NUM_THREADS", value = tostring(var.worker_torch_threads) },
+        { name = "LABS_EAGER_LOAD", value = "true" },
+      ])
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          awslogs-group         = aws_cloudwatch_log_group.this.name
+          awslogs-region        = data.aws_region.current.name
+          awslogs-stream-prefix = "worker"
+        }
+      }
+      secrets = local.mongo_secret
+      mountPoints = [{
+        sourceVolume  = "models"
+        containerPath = "/models"
+        readOnly      = false
+      }]
     }
-    secrets = local.mongo_secret
-    mountPoints = [{
-      sourceVolume  = "models"
-      containerPath = "/models"
-      readOnly      = false
-    }]
-  }])
+  ])
 
   # Host path, not an EBS volume per task. The weights survive task
   # replacement on the same instance, so only a genuinely new instance pays
@@ -1250,8 +1583,16 @@ resource "aws_appautoscaling_target" "worker" {
   # A warm floor, not zero. A cold worker pays an image pull plus ~10 s of
   # model load, so the first submission after an idle period would wait
   # minutes. One warm worker is ~$210/month and buys a predictable p50.
-  min_capacity = 1
-  max_capacity = 20
+  min_capacity = var.worker_min_tasks
+
+  # Derived, never a literal. A worker task reserves `worker_task_cpu` and an
+  # instance offers one instance-worth of CPU, so the fleet can only ever run
+  # `worker_max_size` tasks. A larger ceiling here does not buy throughput: ECS
+  # happily raises desiredCount to it, the extra tasks find no instance with
+  # room, and they sit PENDING until the burst ends. A hardcoded 20 against a
+  # 4-instance fleet left 13 tasks PENDING for an entire benchmark and made
+  # every autoscaling signal unreadable.
+  max_capacity = var.worker_max_size
 }
 
 # Backlog PER WORKER, not raw queue depth. A target on depth alone cannot
@@ -1451,6 +1792,20 @@ resource "aws_cloudwatch_metric_alarm" "dlq" {
 # Outputs
 ###############################################################################
 output "alb_dns_name" { value = aws_lb.this.dns_name }
+
+# The HTTPS front door. Null when enable_cloudfront is false, in which case
+# callers reach the ALB directly - over plain HTTP unless certificate_arn is set.
+output "https_url" {
+  value = (var.enable_cloudfront
+    ? "https://${aws_cloudfront_distribution.this[0].domain_name}"
+  : (var.certificate_arn != "" ? "https://${aws_lb.this.dns_name}" : null))
+  description = "Use this, not alb_dns_name. API keys should not cross the internet in cleartext."
+}
+
+output "origin_locked" {
+  value       = local.lock_origin
+  description = "False means the ALB still answers on plain HTTP for anyone who knows its hostname."
+}
 output "queue_url" { value = aws_sqs_queue.analyses.url }
 output "audio_bucket" { value = aws_s3_bucket.audio.id }
 

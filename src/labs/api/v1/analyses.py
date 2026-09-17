@@ -363,7 +363,7 @@ async def create_analysis(
     # of the same song is different bytes and will be analysed again; catching
     # that needs acoustic fingerprinting, which is not implemented.
     if not no_cache:
-        prior = _dedup_hit(path, mode)
+        prior = _dedup_hit(path, mode, who.id)
         if prior:
             _unlink(path)
             return JSONResponse(status_code=200, content=prior)
@@ -417,6 +417,27 @@ async def create_analysis(
             # the whole fleet, which is a far tighter limit than intended.
             _dispatch_remote(path, job.id, mode, verify, display_name, genre,
                              reference, fields, webhook_url, who, request_id)
+            # Drop the local record now that the fleet owns the job.
+            #
+            # It is this process's copy, and NOTHING in this process will ever
+            # advance it: the worker that does the work is a different
+            # container and reports progress to MongoDB. Left in the store it
+            # is not merely stale, it is authoritative - `get_analysis` checks
+            # the in-memory store FIRST and returns on a hit, so the Mongo
+            # fallback that would have given the real status is never reached.
+            #
+            # Behind a load balancer that makes polling a coin flip: a poll
+            # routed to this container sees `queued` forever while one routed
+            # to any other container sees the true state. That is the "job
+            # never completes" failure, and it is invisible in the metrics
+            # because the work itself succeeded. Discarding here is what makes
+            # every container agree with the database.
+            #
+            # Safe because `_dispatch_remote` writes the job to MongoDB BEFORE
+            # publishing the message, so the record a poll falls back to
+            # already exists. `job` stays valid for the response below; only
+            # the store entry goes.
+            store.discard(job.id)
             limiter.release(bucket)
             _unlink(path)
         else:
@@ -611,11 +632,16 @@ def _remote_job_body(job_id: str, who) -> Optional[Dict]:
 
 
 # ---------------------------------------------------------------- helpers --
-def _dedup_hit(path: str, mode: str) -> Optional[Dict]:
+def _dedup_hit(path: str, mode: str,
+               api_key_id: Optional[str]) -> Optional[Dict]:
     """A stored analysis of byte-identical audio in the same mode, if any.
 
     Best effort throughout: a storage problem here must degrade to "run the
     analysis again", never to a failed request.
+
+    Scoped to `api_key_id`: the cache may only return a caller their OWN prior
+    result. See find_report_by_hash for why an unscoped hash lookup both leaks
+    across tenants and hands back a job id the caller cannot poll.
     """
     from ...services.storage import get_mongo
     from ...tools.base import file_digest
@@ -623,9 +649,13 @@ def _dedup_hit(path: str, mode: str) -> Optional[Dict]:
     mongo = get_mongo()
     if not mongo.enabled:
         return None
+    # No owner, no cache: a global lookup is exactly the unsafe case.
+    if not api_key_id:
+        return None
     try:
         digest = file_digest(path)
-        doc = mongo.find_report_by_hash(digest, mode=mode)
+        doc = mongo.find_report_by_hash(digest, mode=mode,
+                                        api_key_id=api_key_id)
         if not doc:
             return None
         result = doc.pop("report", None)
