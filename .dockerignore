@@ -1,0 +1,54 @@
+# The build only needs src/ and the requirements files. Everything else is
+# context the daemon copies and then discards.
+#
+# checkpoints/ alone is 1.2 GB. Without this file every `docker build` ships
+# it to the daemon before the first layer runs - on a cross-architecture
+# build, once per target. Nothing in the Dockerfile copies it: the deep tier
+# fetches its weights from S3 at runtime (see DEPLOYMENT.md, step 3).
+
+# Model weights and audio: large, and fetched at runtime rather than baked.
+checkpoints/
+models/
+audio/
+benchmarks/
+tests/fixtures/audio/
+*.ckpt
+*.pt
+*.pth
+
+# Local virtualenvs - large, and the wrong architecture for the image anyway.
+.venv*/
+venv/
+
+# Version control and CI.
+.git/
+.github/
+
+# Caches and build artefacts.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+*.egg-info/
+
+# Terraform state and plans: these hold infrastructure detail and, in the
+# case of a plan file, variable values. They have no business in an image
+# context.
+deploy/aws/.terraform/
+deploy/aws/*.tfstate
+deploy/aws/*.tfstate.*
+deploy/aws/*.tfvars
+deploy/aws/tfplan*
+deploy/aws/backend.hcl
+
+# Secrets and local environment.
+*.env
+.env*
+
+# Editor and OS noise.
+.DS_Store
+.idea/
+.vscode/
