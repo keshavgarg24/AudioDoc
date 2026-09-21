@@ -1,0 +1,227 @@
+from beat_this.inference import File2Beats
+import torchaudio
+import torch
+from pathlib import Path
+import numpy as np
+from collections import Counter
+import os
+import argparse
+import threading
+from tqdm import tqdm
+import multiprocessing
+import librosa
+import gc
+
+_F2B_CACHE = {}
+_F2B_LOCK = threading.Lock()
+
+
+def _get_file2beats(checkpoint_path, beat_device):
+    """Process-wide File2Beats, built once per (checkpoint, device).
+
+    The tracker was previously constructed and destroyed on every call, which
+    put a full model load - torch.hub resolution, checkpoint deserialisation,
+    weight upload to the device - on the critical path of every single
+    request. It holds no per-call state, so one instance serves all of them.
+
+    Only construction is locked. Inference re-entrancy follows the same
+    assumption the detector already makes about its own eval-mode models.
+    """
+    key = (checkpoint_path, beat_device)
+    obj = _F2B_CACHE.get(key)
+    if obj is None:
+        with _F2B_LOCK:
+            obj = _F2B_CACHE.get(key)
+            if obj is None:
+                obj = File2Beats(checkpoint_path=checkpoint_path,
+                                 device=beat_device, dbn=False)
+                _F2B_CACHE[key] = obj
+    return obj
+
+
+def get_segments_from_wav(wav_path, device="cuda", max_duration=300, checkpoint_path="final0"):
+    # PyTorch's torch.hub.load has a bug with 'mps' device validation in some versions.
+    # We fallback to 'cpu' for File2Beats to avoid AttributeError: module 'torch.mps' has no attribute 'current_device'
+    beat_device = "cpu" if device == "mps" else device
+
+    # Also fallback to cpu if cuda is passed but unavailable (to prevent beat_this from auto-resolving to mps)
+    if beat_device == "cuda" and not torch.cuda.is_available():
+        beat_device = "cpu"
+
+    file2beats = _get_file2beats(checkpoint_path, beat_device)
+    beats, downbeats = file2beats(wav_path)
+
+    return beats, downbeats
+
+def find_optimal_segment_length(downbeats, round_decimal=1, bar_length=4):
+    if len(downbeats) < 2:
+        return 10.0, downbeats
+    
+    intervals = np.diff(downbeats)
+    rounded_intervals = np.round(intervals, round_decimal)
+    
+    interval_counter = Counter(rounded_intervals)
+    most_common_interval = interval_counter.most_common(1)[0][0]
+    
+    cleaned_downbeats = [downbeats[0]]
+    
+    for i in range(1, len(downbeats)):
+        interval = rounded_intervals[i-1]
+        if abs(interval - most_common_interval) <= most_common_interval * 0.1:
+            cleaned_downbeats.append(downbeats[i])
+    
+    return float(most_common_interval * bar_length), np.array(cleaned_downbeats)
+
+def process_audio_file(file_info, output_base_dir, device="cuda", max_duration=300, min_duration=30):
+    audio_file, relative_path, output_subdir = file_info
+
+    output_dir = Path(output_base_dir) / output_subdir
+    file_seg_dir = output_dir / audio_file.stem
+
+    if file_seg_dir.exists() and list(file_seg_dir.glob("segment_*.mp3")):
+        return -1
+    
+    file_size_mb = os.path.getsize(audio_file) / (1024 * 1024)
+    if file_size_mb > 100:
+        return 0
+    
+    info = torchaudio.info(str(audio_file))
+    total_duration = info.num_frames / info.sample_rate
+    
+    if total_duration < min_duration:
+        return 0
+    
+    beats, downbeats = get_segments_from_wav(str(audio_file), device=device, max_duration=max_duration)
+    
+    if beats is None or downbeats is None or len(downbeats) == 0:
+        return 0
+    
+    optimal_length, cleaned_downbeats = find_optimal_segment_length(downbeats)
+    
+    file_seg_dir.mkdir(exist_ok=True, parents=True)
+    
+    sample_rate = info.sample_rate
+    
+    if total_duration > max_duration:
+        total_duration = max_duration
+    
+    segments_count = 0
+    
+    for i, start_time in enumerate(cleaned_downbeats):
+        end_time = start_time + optimal_length
+        
+        if end_time > total_duration:
+            continue
+        
+        start_frame = int(start_time * sample_rate)
+        end_frame = int(end_time * sample_rate)
+        
+        segment, sr = torchaudio.load(
+            str(audio_file), 
+            frame_offset=start_frame,
+            num_frames=end_frame - start_frame
+        )
+        
+        save_path = file_seg_dir / f"segment_{i}.mp3"
+        torchaudio.save(
+            str(save_path), 
+            segment, 
+            sr,
+            backend = "sox",
+            format="mp3",
+            compression=320
+        )
+        segments_count += 1
+        
+        del segment
+    
+    torch.cuda.empty_cache() if device == "cuda" else None
+    gc.collect()
+
+    return segments_count
+
+def process_file_wrapper(args):
+    return process_audio_file(*args)
+
+def segment_dataset(base_dir, output_base_dir, num_workers=4, device="cuda", max_duration=300, min_duration=30, labels=None):
+    base_path = Path(base_dir)
+    
+    stats = {
+        "processed_files": 0,
+        "extracted_segments": 0,
+        "failed_files": 0,
+        "skipped_files": 0,
+    }
+    
+    if labels is None:
+        labels = ["ai_cover", "real", "fake"]
+    
+    for label in labels:
+        input_dir = base_path / label 
+        
+        if not input_dir.exists():
+            continue
+        
+        audio_files = []
+        audio_extensions = {'.wav', '.mp3', '.flac', '.m4a', '.aac', '.ogg'}
+        
+        for file_path in input_dir.rglob('*'):
+            if file_path.is_file() and file_path.suffix.lower() in audio_extensions:
+                relative_path = file_path.relative_to(base_path)
+                output_subdir = relative_path.parent
+                audio_files.append((file_path, relative_path, output_subdir))
+        
+        if not audio_files:
+            continue
+        
+        audio_files.sort(key=lambda x: os.path.getsize(x[0]))
+        
+        args_list = [(file_info, output_base_dir, device, max_duration, min_duration) for file_info in audio_files]
+        
+        with multiprocessing.Pool(num_workers) as pool:
+            results = list(tqdm(pool.imap(process_file_wrapper, args_list), 
+                              total=len(args_list), desc=f"Processing {label}"))
+        
+        for segments_count in results:
+            if segments_count == -1:
+                stats["skipped_files"] += 1
+            elif segments_count > 0:
+                stats["processed_files"] += 1
+                stats["extracted_segments"] += segments_count
+            else:
+                stats["failed_files"] += 1
+    
+    print(f"Successfully processed: {stats['processed_files']} files")
+    print(f"Failed: {stats['failed_files']} files")
+    print(f"Skipped (already processed): {stats['skipped_files']} files")
+    print(f"Total segments: {stats['extracted_segments']}")
+    print(f"Average segments per file: {stats['extracted_segments'] / max(1, stats['processed_files']):.2f}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Extract segments from audio files recursively")
+    parser.add_argument("--input", type=str, default="",
+                        help="Input directory with audio files")
+    parser.add_argument("--output", type=str, default="",
+                        help="Output directory for segments")
+    parser.add_argument("--workers", type=int, default=14,
+                        help="Number of parallel workers")
+    parser.add_argument("--device", type=str, default="cuda",
+                        help="Device for beat extraction")
+    parser.add_argument("--max-duration", type=int, default=300,
+                        help="Maximum audio duration in seconds")
+    parser.add_argument("--min-duration", type=int, default=30,
+                        help="Minimum audio duration in seconds")
+    parser.add_argument("--labels", nargs='+', default=None,
+                        help="Labels to process")
+    
+    args = parser.parse_args()
+    
+    segment_dataset(
+        base_dir=args.input,
+        output_base_dir=args.output,
+        num_workers=args.workers,
+        device=args.device,
+        max_duration=args.max_duration,
+        min_duration=args.min_duration,
+        labels=args.labels
+    )

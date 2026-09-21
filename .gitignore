@@ -14,8 +14,11 @@ models/
 *.pt
 *.pth
 
-#testing audio
-audio
+# Test audio dropped at the repo root, never committed. Anchored with a
+# leading slash: the bare pattern `audio` matches a directory of that name at
+# any depth, which silently excluded the src/labs/audio package - real source,
+# imported by analysis/audio.py - from every clone.
+/audio/
 
 # Test fixtures: audio is not committed
 tests/fixtures/audio/*
