@@ -6,32 +6,42 @@
 # build, once per target. Nothing in the Dockerfile copies it: the deep tier
 # fetches its weights from S3 at runtime (see DEPLOYMENT.md, step 3).
 
-# Model weights and audio: large, and fetched at runtime rather than baked.
-checkpoints/
-models/
-audio/
-benchmarks/
-tests/fixtures/audio/
+# Model weights and scratch audio: large, and fetched at runtime rather than
+# baked into the image.
+#
+# Every directory pattern here is anchored with a leading slash so it matches
+# only at the context root. This is deliberate: `audio` unanchored would also
+# match src/labs/audio/, which is real source the deep pipeline imports, and
+# that is exactly the mistake the .gitignore in this repo used to make. The
+# Level-1 ONNX weights under src/labs/screen/weights/ must also survive - the
+# screen tier is useless without them, and they are why the *.pt/*.pth/*.ckpt
+# patterns below name those extensions rather than a directory.
+/checkpoints/
+/models/
+/audio/
+/benchmarks/
+/tests/fixtures/audio/
 *.ckpt
 *.pt
 *.pth
 
 # Local virtualenvs - large, and the wrong architecture for the image anyway.
-.venv*/
-venv/
+/.venv*/
+/venv/
 
 # Version control and CI.
-.git/
-.github/
+/.git/
+/.github/
 
-# Caches and build artefacts.
-__pycache__/
+# Caches and build artefacts. __pycache__ is intentionally unanchored: it
+# appears at every level and none of it belongs in an image.
+**/__pycache__/
 *.py[cod]
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
-build/
-dist/
+/.pytest_cache/
+/.ruff_cache/
+/.mypy_cache/
+/build/
+/dist/
 *.egg-info/
 
 # Terraform state and plans: these hold infrastructure detail and, in the
