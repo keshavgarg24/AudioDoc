@@ -61,17 +61,48 @@ def _pct(x) -> float:
 # --------------------------------------------------------------------------
 # rhythm
 # --------------------------------------------------------------------------
-def analyse_rhythm(downbeats_raw, downbeats_clean, segment_seconds: float) -> Dict:
+def analyse_rhythm(downbeats_raw, downbeats_clean, segment_seconds: float,
+                   musical_rhythm: Optional[Dict] = None) -> Dict:
     """Tempo and how mechanically regular it is.
 
     `segment_seconds` is the modal 4-bar length the segmenter settled on, so
     bar = segment/4 and beat = bar/4 under the 4/4 assumption the repo makes.
+
+    That derivation exists to describe the detection grid, not to be a tempo
+    estimate, and it used to be published as `bpm` with no metrical-level
+    correction. Alongside `musical.rhythm.bpm`, which is a dedicated tracker
+    with that correction applied, a single response could therefore carry two
+    fields called `bpm` that differed by a factor of two - 71 against 140 on
+    the same file - and the human-readable summary quoted the wrong one.
+
+    So `musical_rhythm` wins when musical analysis ran: it is the better
+    measurement and it is what every other consumer (character, industry,
+    Tempo Lab) already reads. The grid figure is kept under `grid_bpm`
+    because the detection reasoning is derived from it and dropping it would
+    make that reasoning unauditable.
     """
+    from .musical import notated_tempo
+
     raw = np.asarray(downbeats_raw, dtype=float).ravel()
     clean = np.asarray(downbeats_clean, dtype=float).ravel()
 
     bar_s = segment_seconds / 4.0 if segment_seconds else 0.0
-    bpm = (60.0 * 4.0 / bar_s) if bar_s > 0 else 0.0
+    grid_bpm = (60.0 * 4.0 / bar_s) if bar_s > 0 else 0.0
+
+    # `is not None`, not truthiness: a tracker that ran and found no pulse
+    # reports 0, and that 0 must be published as-is. Falling back to the grid
+    # in that case would put two different tempos in one response again.
+    tracked = (musical_rhythm or {}).get("bpm")
+    if tracked is not None:
+        bpm, bpm_source = float(tracked), "beat tracker"
+        level = (musical_rhythm or {}).get("metrical_level", "as tracked")
+    else:
+        # No musical analysis on this request. Apply the same metrical rule
+        # rather than publishing a raw half-time figure as the tempo, and say
+        # so: a doubled figure with no label is indistinguishable from a
+        # measured one.
+        bpm, level, _reason = notated_tempo(grid_bpm)
+        bpm_source = "detection grid"
 
     intervals = np.diff(raw) if raw.size > 1 else np.array([])
     if intervals.size:
@@ -89,6 +120,9 @@ def analyse_rhythm(downbeats_raw, downbeats_clean, segment_seconds: float) -> Di
 
     return {
         "bpm": _i(bpm),
+        "bpm_source": bpm_source,
+        "metrical_level": level,
+        "grid_bpm": _i(grid_bpm),
         "bar_seconds": _f(bar_s, 3),
         "segment_seconds": _f(segment_seconds, 2),
         "downbeats_detected": int(raw.size),
@@ -353,7 +387,10 @@ def build_findings(verdict: Dict, segs: Dict, struct: Dict, rhythm: Dict) -> Lis
     out.append({
         "type": "rhythm", "weight": "secondary",
         "title": r_title,
-        "detail": (f"Estimated {rhythm['bpm']} BPM over "
+        # Tempo and timing come from different places now - the tracker and
+        # the detection grid respectively - so the sentence no longer implies
+        # the BPM was read off the downbeat count.
+        "detail": (f"Estimated {rhythm['bpm']} BPM. Timing measured over "
                    f"{rhythm['downbeats_detected']} detected downbeats "
                    f"({rhythm['downbeats_retained']} kept after filtering to the "
                    f"modal bar length). Inter-downbeat variation "
@@ -430,7 +467,8 @@ def build_report(
     musical_data = musical_data or {}
     production_data = production_data or {}
 
-    rhythm = analyse_rhythm(downbeats_raw, downbeats_clean, segment_seconds)
+    rhythm = analyse_rhythm(downbeats_raw, downbeats_clean, segment_seconds,
+                            musical_rhythm=musical_data.get("rhythm"))
 
     report: Dict = {
         "mode": mode,

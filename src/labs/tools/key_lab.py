@@ -24,6 +24,7 @@ does not change the mixing answer.
 """
 from __future__ import annotations
 
+import logging
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -31,12 +32,14 @@ import numpy as np
 from ..analysis.musical import _CAMELOT_MAJOR, _CAMELOT_MINOR, _MAJOR, _MINOR, PITCHES
 from .base import Decoded, ToolSpec, _f
 
+log = logging.getLogger(__name__)
+
 SPEC = ToolSpec(
     slug="key-lab",
     name="Key Lab",
     summary="Key, scale, Camelot code and compatible keys for harmonic mixing.",
     inputs=("file",),
-    typical_seconds=(4, 10),
+    typical_seconds=(2, 8),
     accuracy="Around 75% exact, rising to roughly 90% when relative-major and "
              "perfect-fifth relationships are counted as near matches. Ranked "
              "alternatives are always returned.",
@@ -59,13 +62,14 @@ _MINOR_SCALE = (0, 2, 3, 5, 7, 8, 10)
 
 
 def run(audio: Decoded, **_) -> Dict:
-    import librosa
-
     y, sr = audio.musical, audio.sr_musical
 
-    full = _chroma(librosa, y, sr)
-    bass = _chroma(librosa, y, sr, fmin=librosa.note_to_hz("C1"), n_octaves=3)
-    edges = _edge_profile(librosa, y, sr)
+    # One transform, folded for both registers, and kept so the chord pass
+    # below does not repeat it. See analysis.musical.chroma_stack.
+    stack = _stack(y, sr)
+    full = _profile(stack["full"])
+    bass = _profile(stack["bass"])
+    edges = _edge_profile(y, sr)
 
     candidates = _rank(full, bass, edges)
     if not candidates:
@@ -89,7 +93,7 @@ def run(audio: Decoded, **_) -> Dict:
         "chroma": [{"pitch": PITCHES[i], "weight": _f(float(full[i]), 4)}
                    for i in range(12)],
         "harmonic_mixing": _mixing(camelot),
-        "chords": _chords(audio),
+        "chords": _chords(audio, stack["full"]),
         "headline": {
             "key": best["key"],
             "camelot": camelot,
@@ -99,7 +103,7 @@ def run(audio: Decoded, **_) -> Dict:
     }
 
 
-def _chords(audio) -> Dict:
+def _chords(audio, chroma: Optional[np.ndarray] = None) -> Dict:
     """Beat-synchronous chord estimate, explicitly marked approximate.
 
     Template matching on chroma lands around 65% on triads - materially worse
@@ -109,7 +113,8 @@ def _chords(audio) -> Dict:
     from ..analysis.musical import harmony
 
     try:
-        h = harmony(audio.musical, audio.sr_musical, audio.beats())
+        h = harmony(audio.musical, audio.sr_musical, audio.beats(),
+                    chroma=chroma)
     except Exception:
         return {"available": False}
 
@@ -131,38 +136,48 @@ def _chords(audio) -> Dict:
     }
 
 
-def _chroma(librosa, y: np.ndarray, sr: int, fmin: Optional[float] = None,
-            n_octaves: int = 7) -> np.ndarray:
-    """Normalised 12-bin pitch-class profile."""
+def _stack(y: np.ndarray, sr: int) -> Dict[str, np.ndarray]:
+    """Full-range and bass chroma matrices, or empty ones if the CQT fails.
+
+    A transform failure degrades the tool to "key could not be estimated"
+    rather than failing the request: the caller's `_rank` already returns no
+    candidates for an all-zero profile, and `run` reports that honestly.
+    """
+    from ..analysis.musical import chroma_stack
+
     try:
-        kw = {"y": y, "sr": sr, "n_octaves": n_octaves}
-        if fmin is not None:
-            kw["fmin"] = fmin
-        c = librosa.feature.chroma_cqt(**kw)
-        prof = c.mean(axis=1)
-        total = float(prof.sum())
-        return prof / total if total > 0 else prof
+        return chroma_stack(y, sr)
     except Exception:
-        return np.zeros(12)
+        log.warning("Chroma transform failed", exc_info=True)
+        empty = np.zeros((12, 1))
+        return {"full": empty, "bass": empty}
 
 
-def _edge_profile(librosa, y: np.ndarray, sr: int) -> np.ndarray:
+def _profile(chroma: np.ndarray) -> np.ndarray:
+    """Normalised 12-bin pitch-class profile from a chroma matrix."""
+    prof = chroma.mean(axis=1)
+    total = float(prof.sum())
+    return prof / total if total > 0 else prof
+
+
+def _edge_profile(y: np.ndarray, sr: int) -> np.ndarray:
     """Chroma of the opening and closing windows only.
 
     Popular music resolves to the tonic at the start and the end far more often
     than in the middle, which is exactly the evidence a full-track average
-    washes out.
+    washes out. This is a separate, small transform on 16 s of audio rather
+    than a slice of the full one so that its tuning estimate comes from the
+    same windows it profiles.
     """
+    import librosa
+
     try:
         window = max(int(sr * 8.0), 1)
         if y.size < window * 3:
             return np.zeros(12)
         head, tail = y[:window], y[-window:]
         combined = np.concatenate([head, tail])
-        c = librosa.feature.chroma_cqt(y=combined, sr=sr)
-        prof = c.mean(axis=1)
-        total = float(prof.sum())
-        return prof / total if total > 0 else prof
+        return _profile(librosa.feature.chroma_cqt(y=combined, sr=sr))
     except Exception:
         return np.zeros(12)
 

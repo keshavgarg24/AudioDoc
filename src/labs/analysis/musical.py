@@ -43,6 +43,36 @@ _CHORD_SHAPES = {
     "maj7": [0, 4, 7, 11], "min7": [0, 3, 7, 10],
 }
 
+
+def _chord_bank():
+    """The 108 chord templates as one 12 x 108 matrix, built once at import.
+
+    Scoring a beat against every template is a dot product per template, which
+    is the same arithmetic as one matrix multiply. Rebuilding the templates
+    inside the per-beat loop - which is what this replaces - allocated 108
+    arrays for every beat in the track and made the chord pass the second most
+    expensive thing in Key Lab after the transform itself.
+    """
+    bank = np.zeros((12, 12 * len(_CHORD_SHAPES)))
+    names: List[str] = []
+    col = 0
+    for shift in range(12):
+        for suffix, tones in _CHORD_SHAPES.items():
+            for tone in tones:
+                bank[(tone + shift) % 12, col] = 1.0
+            bank[:, col] /= bank[:, col].sum()
+            names.append(f"{PITCHES[shift]}{suffix}")
+            col += 1
+    return bank, names
+
+
+_CHORD_BANK, _CHORD_NAMES = _chord_bank()
+
+# librosa's chroma_cqt runs its transform at 36 bins per octave and folds down
+# to 12. Matching that here is what makes `chroma_stack` a drop-in replacement
+# rather than an approximation - see the docstring there.
+_CHROMA_BPO = 36
+
 # Drum voice bands (Hz). An approximation of kick / snare / hat energy.
 _DRUM_BANDS = [("kick", 30, 120), ("snare", 180, 900), ("hat", 6000, 12000)]
 
@@ -129,15 +159,7 @@ def rhythm(y: np.ndarray, sr: int, duration: float,
         np.max(librosa.autocorrelate(onset_env, max_size=int(sr / 512 * 4)))
         / (np.sum(onset_env ** 2) + 1e-9), 0, 1)) if onset_env.size else 0.0
 
-    # Half-time and double-time feels report a tracker tempo at the wrong
-    # metrical level, so report both and say which is likely notated.
-    notated, level, reason = tempo, "as tracked", "tracker tempo matches the notated pulse"
-    if tempo < 95:
-        notated, level = tempo * 2, "half-time"
-        reason = "slow tracked pulse against dense subdivision, likely notated at double"
-    elif tempo > 190:
-        notated, level = tempo / 2, "double-time"
-        reason = "very fast tracked pulse, likely notated at half"
+    notated, level, reason = notated_tempo(tempo)
 
     return {
         "bpm": _i(notated),
@@ -366,10 +388,90 @@ def drums(y: np.ndarray, sr: int, beat_times: List[float],
 
 
 # --------------------------------------------------------------------------
-def harmony(y: np.ndarray, sr: int, beat_times: List[float]) -> Dict:
+def notated_tempo(tempo: float) -> tuple:
+    """Fold a tracked pulse to the tempo a musician would write down.
+
+    Beat trackers lock onto whichever pulse is strongest, which for a track
+    with dense subdivision is often half or double the notated tempo. A 140
+    BPM trap beat is routinely tracked at 70.
+
+    Shared rather than duplicated: the detection pipeline derives its own
+    tempo from the segmenter's bar length, and when the two disagreed about
+    whether to double a figure the same report carried "71 BPM" in its prose
+    and "140" in its musical section.
+
+    Returns (notated_bpm, metrical_level, reason).
+    """
+    if tempo < 95:
+        return (tempo * 2, "half-time",
+                "slow tracked pulse against dense subdivision, "
+                "likely notated at double")
+    if tempo > 190:
+        return (tempo / 2, "double-time",
+                "very fast tracked pulse, likely notated at half")
+    return (tempo, "as tracked", "tracker tempo matches the notated pulse")
+
+
+# --------------------------------------------------------------------------
+def chroma_stack(y: np.ndarray, sr: int,
+                 octaves: int = 7, bass_octaves: int = 3) -> Dict[str, np.ndarray]:
+    """Full-range and bass-register chroma from ONE constant-Q transform.
+
+    Key Lab needs a full-range chroma to decide the note set and a bass-only
+    chroma to decide which member of that set is the tonic. Asking librosa for
+    both is two `chroma_cqt` calls, and a CQT is the single most expensive
+    thing either of them does.
+
+    The bass chroma is not independent evidence though: `chroma_cqt(fmin=C1,
+    n_octaves=3)` transforms the same signal over the first three octaves of
+    the same filter bank the seven-octave call already covers. So the transform
+    is run once here and folded twice - all 252 bins for the full profile, the
+    first 108 for the bass.
+
+    This reproduces librosa's own pipeline rather than approximating it: the
+    36-bins-per-octave transform, the shared tuning estimate, `cq_to_chroma`
+    and the infinity-norm column normalisation are what `chroma_cqt` does
+    internally. The full-range result is bit-identical to `chroma_cqt(y, sr,
+    n_octaves=7)`; the bass result differs from a standalone three-octave call
+    only in the last two decimal places of individual frames, because a shorter
+    filter bank rounds its frame count differently, and is identical to six
+    decimals in the time-averaged profile that is the only thing read from it.
+    tests/unit/test_chroma_stack.py pins both claims.
+
+    Returns {"full": 12 x frames, "bass": 12 x frames}.
+    """
     import librosa
 
-    chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+    fmin = librosa.note_to_hz("C1")
+    tuning = librosa.estimate_tuning(y=y, sr=sr, bins_per_octave=_CHROMA_BPO)
+    cqt = np.abs(librosa.cqt(y=y, sr=sr, fmin=fmin,
+                             n_bins=octaves * _CHROMA_BPO,
+                             bins_per_octave=_CHROMA_BPO, tuning=tuning))
+
+    def fold(n_bins: int) -> np.ndarray:
+        weights = librosa.filters.cq_to_chroma(
+            n_bins, bins_per_octave=_CHROMA_BPO, n_chroma=12, fmin=fmin)
+        return librosa.util.normalize(weights.dot(cqt[:n_bins]),
+                                      norm=np.inf, axis=0)
+
+    return {"full": fold(octaves * _CHROMA_BPO),
+            "bass": fold(bass_octaves * _CHROMA_BPO)}
+
+
+# --------------------------------------------------------------------------
+def harmony(y: np.ndarray, sr: int, beat_times: List[float],
+            chroma: Optional[np.ndarray] = None) -> Dict:
+    """Key, scale conformance and a beat-synchronous chord estimate.
+
+    `chroma` lets a caller that has already transformed this exact signal hand
+    the result in. Key Lab is the case that matters: it computes a full-range
+    chroma to rank keys and then calls this, which used to run the identical
+    `chroma_cqt` a second time on the same samples for the same answer.
+    """
+    import librosa
+
+    if chroma is None:
+        chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
     profile = chroma.mean(axis=1)
     profile = profile / (profile.sum() or 1.0)
 
@@ -393,23 +495,15 @@ def harmony(y: np.ndarray, sr: int, beat_times: List[float]) -> Dict:
         frames = librosa.time_to_frames(beats, sr=sr)
         frames = np.clip(frames, 0, chroma.shape[1] - 1)
         sync = librosa.util.sync(chroma, frames, aggregate=np.median)
-        for i in range(sync.shape[1]):
-            v = sync[:, i]
-            if v.sum() <= 0:
-                continue
-            v = v / v.sum()
-            top_name, top_score = None, -1.0
-            for shift in range(12):
-                for suffix, tones in _CHORD_SHAPES.items():
-                    tpl = np.zeros(12)
-                    for t in tones:
-                        tpl[(t + shift) % 12] = 1.0
-                    tpl /= tpl.sum()
-                    s = float(np.dot(v, tpl))
-                    if s > top_score:
-                        top_score, top_name = s, f"{PITCHES[shift]}{suffix}"
-            if top_name:
-                progression.append(top_name)
+        # One matmul against the prebuilt bank, scoring every beat against
+        # every template at once. `argmax` ties break to the lowest column,
+        # which is the order the nested loop's strict `>` also kept.
+        totals = sync.sum(axis=0)
+        keep = totals > 0
+        if keep.any():
+            normalised = sync[:, keep] / totals[keep]
+            best = (normalised.T @ _CHORD_BANK).argmax(axis=1)
+            progression = [_CHORD_NAMES[i] for i in best]
 
     # Collapse consecutive repeats into the readable progression.
     collapsed: List[str] = []
@@ -546,7 +640,8 @@ def analyse(path: str, tracker_beats: Optional[List[float]] = None,
             "rhythm": r,
             "groove": groove(y, sr, beat_times, y_percussive=y_perc),
             "drums": drums(y, sr, beat_times, y_percussive=y_perc),
-            "harmony": harmony(y, sr, beat_times),
+            "harmony": harmony(y, sr, beat_times,
+                               chroma=cache.chroma(ANALYSIS_SR, MAX_SECONDS)),
             "arrangement": arrangement(y, sr, duration),
             "analysed_seconds": _f(duration, 2),
         }

@@ -176,6 +176,21 @@ Expect 40 seconds to 3 minutes depending on length. Slower than that:
 - Check the host is not oversubscribed — `docker stats` during a run.
 - Long files cost proportionally more, bounded by `LABS_MAX_SEGMENTS`.
 
+### The first tool run on a new task takes 20 seconds, then 2
+
+That is librosa compiling its numba kernels, and it means the image was
+built without its compiled-kernel cache. Every image build runs
+`labs.core.warmup` and fails if no kernel was written, so a correctly built
+image never shows this. At startup the healthy log line is:
+
+    Signal path warm-up skipped: N compiled kernels already cached in /opt/numba-cache
+
+If instead you see `NUMBA_CACHE_DIR is set but holds no compiled kernels`,
+the running image was not built from this Dockerfile, or the task definition
+overrides `NUMBA_CACHE_DIR` or `NUMBA_CPU_NAME`. Both must be left to the
+image: the cache is keyed on the CPU target, and `generic` is what makes one
+cache serve the Mac that built it, Fargate Graviton and EC2 x86 alike.
+
 ### 429 `too_many_inflight`
 
 The key is at its concurrent-analysis limit. This is a concurrency bound, not a

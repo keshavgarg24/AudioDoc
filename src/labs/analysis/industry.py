@@ -156,8 +156,9 @@ def vocal_presence(features: Dict, musical: Dict) -> Dict:
 
     return {"verdict": verdict, "score": score, "midrange_share": _f(mid),
             "note": note,
-            "caveat": ("Estimated from the spectral balance, not from source "
-                       "separation, so a lead synth can read like a vocal.")}
+            "caveat": ("Estimated from the spectral balance and the harmonic "
+                       "share of the signal, not from vocal stem separation, "
+                       "so a lead synth can read like a vocal.")}
 
 
 # --------------------------------------------------------------------------

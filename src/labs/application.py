@@ -66,6 +66,14 @@ async def lifespan(app: FastAPI):
             "are not stored and identical audio is re-analysed on every "
             "submission.")
 
+    # Compile librosa's JIT paths off the request path. The Dockerfile already
+    # bakes the numba cache into the image, so with a correctly built image
+    # this returns almost immediately; it is here so an image built without
+    # that step degrades to a slow warm-up instead of a slow first caller.
+    # Backgrounded because blocking would delay the first health check.
+    from .core.warmup import warm_in_background
+    warm_in_background()
+
     # Level 1 first, and unconditionally. Building the two ORT sessions parses
     # and plans both graphs, which is most of the tier's fixed cost, and it
     # takes well under a second - so there is no reason to make the first

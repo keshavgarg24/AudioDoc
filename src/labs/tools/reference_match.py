@@ -35,7 +35,7 @@ SPEC = ToolSpec(
     summary="Compare your track against a reference and get the differences "
             "that matter, band by band.",
     inputs=("file", "reference"),
-    typical_seconds=(10, 20),
+    typical_seconds=(4, 15),
     accuracy="The differences are measurement-grade: both files are level "
              "matched, then compared band by band. Interpretation of a "
              "difference depends on the material.",

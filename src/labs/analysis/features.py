@@ -195,10 +195,12 @@ def _dynamics(y: np.ndarray, sr: int) -> Dict:
 
 
 # --------------------------------------------------------------------------
-def _tonal(y: np.ndarray, sr: int, energies: Optional[tuple] = None) -> Dict:
+def _tonal(y: np.ndarray, sr: int, energies: Optional[tuple] = None,
+           chroma: Optional[np.ndarray] = None) -> Dict:
     import librosa
 
-    chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+    if chroma is None:
+        chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
     profile = chroma.mean(axis=1)
     profile = profile / (profile.sum() or 1.0)
 
@@ -315,7 +317,8 @@ def extract(path: str, cache: Optional["AudioCache"] = None) -> Dict:
         mono_lo, _ = cache.audio(ANALYSIS_SR, mono=True,
                                  duration=MAX_ANALYSIS_SECONDS)
         _, h_energy, p_energy = cache.split(ANALYSIS_SR, MAX_ANALYSIS_SECONDS)
-        tonal = _tonal(mono_lo, ANALYSIS_SR, energies=(h_energy, p_energy))
+        tonal = _tonal(mono_lo, ANALYSIS_SR, energies=(h_energy, p_energy),
+                       chroma=cache.chroma(ANALYSIS_SR, MAX_ANALYSIS_SECONDS))
         onsets = _onsets(mono_lo, ANALYSIS_SR, duration)
 
         return {

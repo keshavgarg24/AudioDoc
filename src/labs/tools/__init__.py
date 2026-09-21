@@ -24,6 +24,18 @@ _MODULES = (master_check, tempo_lab, key_lab, reference_match, vocal_lab,
 REGISTRY: Dict[str, object] = {m.SPEC.slug: m for m in _MODULES}
 SPECS: Dict[str, ToolSpec] = {m.SPEC.slug: m.SPEC for m in _MODULES}
 
+# Every `typical_seconds` range is measured, not estimated, and they mean a
+# specific thing. Saying so matters because an integrator sizes timeouts and
+# progress UI off these numbers, and the two things they exclude - queue wait
+# and upload - are both larger than the tool runtime under load.
+TYPICAL_SECONDS_NOTE = (
+    "Compute time on the analysis worker for a three to five minute track, "
+    "measured on this deployment. Runtime scales close to linearly with audio "
+    "duration. Excludes upload, queue wait and your own polling interval, so "
+    "the wall-clock time you observe will be longer - size client timeouts "
+    "well above the upper bound."
+)
+
 
 def get(slug: str):
     return REGISTRY.get(slug)
@@ -48,6 +60,7 @@ def catalogue() -> List[Dict]:
             "file_count": s.file_count,
             "scope": s.scope,
             "typical_seconds": list(s.typical_seconds),
+            "typical_seconds_note": TYPICAL_SECONDS_NOTE,
             "accuracy": s.accuracy,
             "basis": s.basis,
             "limitations": list(s.limitations),

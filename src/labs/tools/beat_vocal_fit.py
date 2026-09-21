@@ -33,7 +33,7 @@ SPEC = ToolSpec(
     summary="Upload a beat and a vocal separately and get the key, tempo, "
             "timing and frequency changes needed to make them sit together.",
     inputs=("beat", "vocal"),
-    typical_seconds=(20, 40),
+    typical_seconds=(4, 15),
     accuracy="Key, tempo and timing relationships are near-exact. Masking is "
              "an exact measurement of spectral overlap; the recommended move "
              "is standard mixing practice rather than a measured fact.",

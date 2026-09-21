@@ -55,6 +55,7 @@ class AudioCache:
         self.path = path
         self._pcm: Dict[Tuple[int, bool, Optional[float]], Tuple[np.ndarray, int]] = {}
         self._split: Optional[Tuple[np.ndarray, float, float]] = None
+        self._chroma: Optional[np.ndarray] = None
 
     def audio(self, sr: int, mono: bool,
               duration: Optional[float] = None) -> Tuple[np.ndarray, int]:
@@ -116,10 +117,26 @@ class AudioCache:
         self._split = (y_perc, h_energy, p_energy)
         return self._split
 
+    def chroma(self, sr: int = 22050,
+               duration: Optional[float] = None) -> np.ndarray:
+        """One constant-Q chroma, shared by the tonal and harmony passes.
+
+        Both passes want `chroma_cqt` with default parameters on the same
+        mono array, and the CQT is the most expensive transform in either of
+        them, so like `split` it is computed once per request.
+        """
+        import librosa
+
+        if self._chroma is None:
+            y, _ = self.audio(sr, mono=True, duration=duration)
+            self._chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+        return self._chroma
+
     def release(self) -> None:
         """Drop every buffer. Called once the report is built."""
         self._pcm.clear()
         self._split = None
+        self._chroma = None
 
 
 def cache_for(path: str, cache: Optional[AudioCache]) -> AudioCache:

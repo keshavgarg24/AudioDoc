@@ -86,6 +86,7 @@ class Worker:
         the ~10 s of model load on top of the analysis. Warming first means the
         queue depth reflects real backlog rather than startup.
         """
+        from .core.warmup import warm_signal_paths
         from .ml.detector import get_detector
         from .screen import models as screen_models
 
@@ -95,6 +96,11 @@ class Worker:
         self._detector = get_detector(self.settings)
         started = time.time()
         self._detector.load()
+        # Synchronous here, unlike the API's background call: the whole point
+        # of this method is that no message is pulled until the process can
+        # analyse at full speed, and a compile inside the first job would
+        # count against its visibility timeout.
+        warm_signal_paths()
         log.info("Worker ready in %.1fs", time.time() - started)
 
     # -- the loop -----------------------------------------------------------

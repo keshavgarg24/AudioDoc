@@ -27,7 +27,7 @@ SPEC = ToolSpec(
     name="Tempo Lab",
     summary="BPM with metrical alternatives, tempo drift, and grid tightness.",
     inputs=("file",),
-    typical_seconds=(5, 12),
+    typical_seconds=(1, 5),
     accuracy="Around 90% on steady 4/4 electronic, pop and hip-hop. Lower on "
              "live, rubato, classical and ambient material, where a stable "
              "pulse may not exist.",

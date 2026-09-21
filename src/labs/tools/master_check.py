@@ -22,7 +22,7 @@ SPEC = ToolSpec(
     name="Master Check",
     summary="Loudness, true peak, dynamics and per-platform delivery readiness.",
     inputs=("file",),
-    typical_seconds=(3, 10),
+    typical_seconds=(5, 20),
     accuracy="Measurement-grade. Implements ITU-R BS.1770-4, so results match "
              "any compliant meter to within 0.1 LU.",
     basis="ITU-R BS.1770-4 integrated loudness, 4x-oversampled true peak, and "

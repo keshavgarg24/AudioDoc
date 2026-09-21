@@ -29,7 +29,7 @@ SPEC = ToolSpec(
     summary="Pitch accuracy, range, vibrato, timing and recording hygiene for "
             "an isolated vocal.",
     inputs=("file",),
-    typical_seconds=(12, 25),
+    typical_seconds=(12, 35),
     accuracy="Pitch, range, timing, sibilance and plosive measurements are "
              "measurement-grade on a clean isolated vocal.",
     basis="pYIN fundamental-frequency tracking, deviation from equal "

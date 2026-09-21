@@ -36,11 +36,17 @@ COPY requirements.txt .
 RUN /opt/venv/bin/pip install \
         --extra-index-url https://download.pytorch.org/whl/cpu \
         -r requirements.txt
+# Whole-second mtimes on every source file, see NUMBA_CACHE_DIR below: the
+# compiled-kernel cache is only valid if the build and the running container
+# agree on them, and image export rounds them.
+RUN /opt/venv/bin/python -c "import os; [os.utime(p, (int(os.stat(p).st_atime), int(os.stat(p).st_mtime))) for d, _, fs in os.walk('/opt/venv') for f in fs if f.endswith('.py') for p in [os.path.join(d, f)]]"
 
 # -------------------------------------------------------- screen deps ------
 FROM build-base AS build-screen
 COPY requirements-screen.txt .
 RUN /opt/venv/bin/pip install -r requirements-screen.txt
+# Same as the deep stage above.
+RUN /opt/venv/bin/python -c "import os; [os.utime(p, (int(os.stat(p).st_atime), int(os.stat(p).st_mtime))) for d, _, fs in os.walk('/opt/venv') for f in fs if f.endswith('.py') for p in [os.path.join(d, f)]]"
 
 
 # ====================================================================== #
@@ -60,7 +66,37 @@ ENV PYTHONUNBUFFERED=1 \
     TORCH_HOME=/models/torch \
     XDG_CACHE_HOME=/models/cache \
     LABS_MODELS_DIR=/models \
-    LABS_CKPT_DIR=/models/checkpoints
+    LABS_CKPT_DIR=/models/checkpoints \
+    NUMBA_CACHE_DIR=/opt/numba-cache \
+    NUMBA_CPU_NAME=generic
+
+# The two NUMBA_ settings make the compiled-kernel cache baked below actually
+# get used at runtime, and both are load-bearing.
+#
+# NUMBA_CACHE_DIR: numba's default is __pycache__ beside the installed package,
+# but it only uses that location if it can write to it, and /opt/venv is
+# root-owned while the process runs as `labs`. Without an explicit directory
+# the runtime process would silently fall back to a user cache under
+# XDG_CACHE_HOME, find it empty, and recompile - the exact 20-second first
+# request the bake exists to remove. Kept outside /models because that is a
+# volume: anything written there at build time is discarded.
+#
+# NUMBA_CPU_NAME=generic: cache entries are keyed on the CPU model and feature
+# set of the machine that compiled them. The images are built on a developer
+# Mac (see deploy/aws/04-images.sh) and run on Fargate Graviton and EC2 x86,
+# so a host-specific cache would never match and would recompile anyway.
+# `generic` targets the architecture baseline, which numba documents as the
+# way to share a cache across machines. Measured cost: none (vocal-lab,
+# tempo-lab and master-check within noise of the host-tuned build), because
+# librosa's kernels are scalar dynamic-programming loops that gain nothing
+# from CPU-specific SIMD.
+#
+# A third condition is enforced in the build stages: every cache entry also
+# records the source file's modification time, and it must match exactly at
+# runtime. The build step sees the venv with sub-second mtimes, but exporting
+# the image rounds them to whole seconds, so without the `os.utime` pass
+# above every entry would mismatch and every kernel would silently recompile.
+# This was observed, not theorised: 24 of 24 entries missed before the fix.
 
 # libsndfile for soundfile, ffmpeg for the mp3/m4a decode paths.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -92,6 +128,24 @@ VOLUME ["/models"]
 # ====================================================================== #
 FROM runtime-base AS screen
 COPY --from=build-screen /opt/venv /opt/venv
+
+# Bake librosa's numba cache into the image layer. See core/warmup.py: without
+# this the first caller to reach a fresh container pays the LLVM compile - 11 s
+# on the decode path alone - and on ECS that is every scale-out and every
+# rolling deploy, not a one-off. Logging is switched on so the build output
+# shows the per-step compile times; the cache is handed to `labs` because
+# numba refuses to read from a directory it cannot also write to; and the
+# build fails outright if no kernel was written, because a bake that silently
+# produced nothing is exactly the failure that is otherwise invisible until
+# the first slow request in production.
+RUN python -c "import logging; logging.basicConfig(level=logging.INFO); \
+        from labs.core.warmup import warm_signal_paths; \
+        warm_signal_paths(force=True)" \
+    && chown -R labs:labs "$NUMBA_CACHE_DIR" \
+    && n=$(find "$NUMBA_CACHE_DIR" -name '*.nbi' | wc -l) \
+    && echo "numba cache: $n compiled kernels" \
+    && [ "$n" -gt 0 ]
+
 USER labs
 
 # No weights to load, so readiness is immediate and the probe can be strict.
@@ -111,10 +165,26 @@ CMD ["uvicorn", "labs.application:app", \
 
 
 # ====================================================================== #
+# deep runtime: shared by worker and api, which differ only in entrypoint
+# ====================================================================== #
+FROM runtime-base AS deep-runtime
+COPY --from=build-deep /opt/venv /opt/venv
+
+# Same bake and same gate as the screen stage, done once here rather than
+# once per final stage: the venv is identical, so the compiled kernels are too.
+RUN python -c "import logging; logging.basicConfig(level=logging.INFO); \
+        from labs.core.warmup import warm_signal_paths; \
+        warm_signal_paths(force=True)" \
+    && chown -R labs:labs "$NUMBA_CACHE_DIR" \
+    && n=$(find "$NUMBA_CACHE_DIR" -name '*.nbi' | wc -l) \
+    && echo "numba cache: $n compiled kernels" \
+    && [ "$n" -gt 0 ]
+
+
+# ====================================================================== #
 # worker: consumes SQS, serves nothing
 # ====================================================================== #
-FROM runtime-base AS worker
-COPY --from=build-deep /opt/venv /opt/venv
+FROM deep-runtime AS worker
 USER labs
 
 # No port and no HTTP health check: this container is not in a target group.
@@ -129,8 +199,7 @@ CMD ["python", "-m", "labs.worker"]
 # ====================================================================== #
 # api: both tiers in one process (single-container deployment)
 # ====================================================================== #
-FROM runtime-base AS api
-COPY --from=build-deep /opt/venv /opt/venv
+FROM deep-runtime AS api
 USER labs
 
 EXPOSE 8000
