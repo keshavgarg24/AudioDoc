@@ -31,7 +31,8 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g,
   (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
 
 const MODE_LABEL = {
-  ai: 'AI Detection Report',
+  screen: 'Quick Check Report',
+  ai: 'Full Check Report',
   audio: 'Audio Analysis Report',
   full: 'Complete Analysis Report',
 }

@@ -2,24 +2,43 @@
 
 import React from 'react'
 
+// What the user is choosing between, in their language.
+//
+// Deliberately says nothing about how any of it works - no model names, no
+// architecture, no talk of stages or tiers. What someone needs in order to
+// choose is how long it takes, what they get, and how far they can lean on
+// it. `quick` is first and is the default: the deeper pass costs real time,
+// so it should be something a person opts into rather than something that
+// happens to them.
 export const MODES = [
   {
+    id: 'screen',
+    label: 'Quick check',
+    time: 'a few seconds',
+    desc: 'A fast first read. Settles the obvious cases immediately, and tells '
+      + 'you when a track needs a closer look - which you can start from the '
+      + 'result, without uploading again.',
+  },
+  {
     id: 'ai',
-    label: 'AI detection',
-    time: '1 to 2 min',
-    desc: 'A verdict on whether the track was AI generated, with a timeline across it.',
+    label: 'Full check',
+    time: 'about a minute',
+    desc: 'The quick check, and then a much closer pass over the whole track '
+      + 'whenever the first read is not conclusive. This is the answer to act on.',
   },
   {
     id: 'audio',
     label: 'Audio analysis',
-    time: '40 to 60 sec',
-    desc: 'Tempo, key, groove, mastering, stereo field and delivery readiness.',
+    time: 'under a minute',
+    desc: 'No verdict on origin. Tempo, key, groove, loudness, stereo field '
+      + 'and whether the master is ready to release.',
   },
   {
     id: 'full',
     label: 'Complete report',
     time: '2 to 3 min',
-    desc: 'Everything above in a single case file, detection alongside production.',
+    desc: 'Everything, in one document: the full origin check alongside the '
+      + 'complete production breakdown.',
   },
 ]
 

@@ -137,41 +137,12 @@
 	<path d="M696,152 V168"/>
 </g>
 
-<!-- ================= LABS : audio-flavoured letterforms ================= -->
-<!-- black outline pass -->
-<g fill="none" stroke="#000000" stroke-width="35" stroke-linecap="round" stroke-linejoin="round">
-	<path d="M740,70 V230 H760"/>
-	<path d="M790,230 V196 M820,230 V166 M850,230 V126"/>
-	<path d="M885,230 L945,70 L1005,230"/>
-	<path d="M1048,70 V230"/>
-	<path d="M1048,70 A40,40 0 0 1 1048,150"/>
-	<path d="M1048,150 A40,40 0 0 1 1048,230"/>
-	<path d="M1210,110 C1206,84 1182,70 1158,70 C1126,70 1107,85 1107,110 C1107,137 1132,145 1162,153
-	         C1196,162 1216,173 1216,199 C1216,221 1191,230 1162,230 C1133,230 1109,220 1106,196"/>
-</g>
-<g stroke="#000000" stroke-width="15" stroke-linejoin="round" stroke-linecap="round" fill="none">
-	<path d="M928,163 L928,203 L962,183 Z"/>
-</g>
-
-<!-- white letterforms -->
-<g fill="none" stroke="#FFFFFF" stroke-width="27" stroke-linecap="round" stroke-linejoin="round">
-	<!-- L : stem + baseline foot that rises into an equalizer -->
-	<path d="M740,70 V230 H760"/>
-	<path d="M790,230 V196 M820,230 V166 M850,230 V126"/>
-	<!-- A : open apex like a tuning fork, play-mark crossbar -->
-	<path d="M885,230 L945,70 L1005,230"/>
-	<!-- B : two circular bowls, vinyl / headphone cups -->
-	<path d="M1048,70 V230"/>
-	<path d="M1048,70 A40,40 0 0 1 1048,150"/>
-	<path d="M1048,150 A40,40 0 0 1 1048,230"/>
-	<!-- S : drawn as a single sound-wave curve -->
-	<path d="M1210,110 C1206,84 1182,70 1158,70 C1126,70 1107,85 1107,110 C1107,137 1132,145 1162,153
-	         C1196,162 1216,173 1216,199 C1216,221 1191,230 1162,230 C1133,230 1109,220 1106,196"/>
-</g>
-
-<!-- A crossbar : play triangle -->
-<path d="M928,163 L928,203 L962,183 Z" fill="#FFFFFF" stroke="#FFFFFF" stroke-width="9" stroke-linejoin="round"/>
-<!-- B lower bowl spindle : vinyl centre -->
-<circle cx="1048" cy="190" r="9" fill="#000000"/>
-<circle cx="1048" cy="190" r="9" fill="none" stroke="#FFFFFF" stroke-width="6"/>
+<!-- ================= LABS : plain wordmark ================= -->
+<!-- Set as text rather than drawn letterforms. The decorative version (an
+     equalizer L, a play-triangle A, vinyl-bowl B, sound-wave S) read as a
+     logo of its own next to the beat22 mark; plain type reads as one name. -->
+<text x="740" y="230"
+      font-family="Helvetica Neue, Helvetica, Arial, sans-serif"
+      font-size="168" font-weight="700" letter-spacing="6"
+      fill="#FFFFFF">LABS</text>
 </svg>

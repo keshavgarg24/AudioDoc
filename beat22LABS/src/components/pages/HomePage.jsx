@@ -9,7 +9,7 @@ import HeroPanels from '../visuals/HeroPanels.jsx'
 import ConfirmPopup from '../ConfirmPopup.jsx'
 import AmbientWaves from '../visuals/AmbientWaves.jsx'
 import FeaturedTool from '../FeaturedTool.jsx'
-import { asReport, detect } from '../../lib/api.js'
+import { asReport, detect, escalate } from '../../lib/api.js'
 import { useServiceStatus } from '../../lib/useServiceStatus.js'
 import Link from 'next/link'
 import { TOOLS } from '../../toolConfig.js'
@@ -56,7 +56,7 @@ export default function App() {
   const saved = useRef(loadSaved())
   // Shared with the header: one poll loop for the whole app.
   const status = useServiceStatus()
-  const [mode, setMode] = useState('ai')
+  const [mode, setMode] = useState('screen')
   const [verify, setVerify] = useState(false)
   const [phase, setPhase] = useState(saved.current ? 'done' : 'idle')
   const [file, setFile] = useState(null)
@@ -71,6 +71,10 @@ export default function App() {
   // seconds, so its verdict is shown while Stage 2 is still running rather
   // than holding a bare spinner for the full 90 s.
   const [stage, setStage] = useState(null)
+  // Set when the quick check could not settle the track. The deeper pass is
+  // then offered on the result rather than run automatically.
+  const [canEscalate, setCanEscalate] = useState(false)
+  const [escalating, setEscalating] = useState(false)
   const abortRef = useRef(null)
 
   useEffect(() => {
@@ -97,15 +101,17 @@ export default function App() {
     setResult(null)
     setPhasesDone(false)
     setStage(null)
+    setCanEscalate(false)
     setPhase('working')
     setIsMinimized(false)
 
     const ctrl = new AbortController()
     abortRef.current = ctrl
     try {
-      const { screen, report: deep } = await detect(f, {
+      const { screen, report: deep, canEscalate: more } = await detect(f, {
         mode, verify, signal: ctrl.signal, onStage: setStage,
       })
+      setCanEscalate(Boolean(more))
       // Stage 2 supersedes Stage 1 when it ran: its response already carries
       // the Level-1 evidence under `detection.level_1`, plus
       // `level_agreement` comparing the two. When Stage 1 settled the track
@@ -120,10 +126,34 @@ export default function App() {
     }
   }, [pendingFile, mode, verify])
 
+  // The deeper pass, started from the result rather than on upload. The file
+  // is re-sent because the quick check holds nothing server-side.
+  const runEscalation = useCallback(async () => {
+    if (!file || escalating) return
+    setEscalating(true)
+    setError(null)
+    const ctrl = new AbortController()
+    abortRef.current = ctrl
+    try {
+      const { report: deep } = await escalate(file, {
+        mode: 'ai', verify, signal: ctrl.signal, onStage: setStage,
+      })
+      setReport(deep)
+      saveReport(deep)
+      setCanEscalate(false)
+      window.scrollTo({ top: 0, behavior: 'smooth' })
+    } catch (e) {
+      if (e.name !== 'AbortError') setError(e.message)
+    } finally {
+      setEscalating(false)
+      abortRef.current = null
+    }
+  }, [file, verify, escalating])
+
   const reset = () => {
     setPhase('idle'); setReport(null); setResult(null)
     setPhasesDone(false); setFile(null); setError(null)
-    setIsMinimized(false); setStage(null)
+    setIsMinimized(false); setStage(null); setCanEscalate(false)
     clearSaved()
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }
@@ -241,7 +271,11 @@ export default function App() {
           </div>
         )}
 
-        {phase === 'done' && report && <Report report={report} onReset={reset} />}
+        {phase === 'done' && report && (
+          <Report report={report} onReset={reset}
+                  canEscalate={canEscalate} onEscalate={runEscalation}
+                  escalating={escalating} />
+        )}
 
         {pendingFile && (
           <ConfirmPopup

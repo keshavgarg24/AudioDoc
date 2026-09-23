@@ -7,12 +7,14 @@ const ACCEPT = ['.wav', '.mp3', '.flac', '.m4a', '.aac', '.ogg', '.opus']
 const MAX_BYTES = 50 * 1024 * 1024
 
 const MODE_CTA = {
-  ai: 'Detect AI generation',
+  screen: 'Run the quick check',
+  ai: 'Run the full check',
   audio: 'Analyse the audio',
   full: 'Run the complete report',
 }
+const DEFAULT_CTA = 'Start the analysis'
 
-export default function Dropzone({ onFile, disabled, mode = 'ai', verify, onVerifyChange }) {
+export default function Dropzone({ onFile, disabled, mode = 'screen', verify, onVerifyChange }) {
   const [over, setOver] = useState(false)
   const [error, setError] = useState(null)
   const inputRef = useRef(null)
@@ -69,7 +71,9 @@ export default function Dropzone({ onFile, disabled, mode = 'ai', verify, onVeri
 
           <p className="dz-title">{over ? 'Release to begin' : 'Drop an audio file'}</p>
           <p className="caption">
-            or click to browse, then {MODE_CTA[mode].toLowerCase()}
+            {/* Defaulted: an unrecognised mode should read a little
+                generically, not take the whole landing page down. */}
+            or click to browse, then {(MODE_CTA[mode] || DEFAULT_CTA).toLowerCase()}
           </p>
 
           <div className="formats">

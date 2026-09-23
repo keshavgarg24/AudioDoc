@@ -433,6 +433,30 @@ body {
 .proc { max-width: 64rem; margin: 2.5rem auto; }
 .proc-head { text-align: center; margin-bottom: 2.4rem; }
 
+/* Offered under a quick-check verdict the service could not settle.
+   Accented rather than warned: nothing has gone wrong, there is simply a
+   better answer available if the reader wants to spend a minute on it. */
+.escalate {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+  margin: 1.5rem 0;
+  padding: 1.25rem 1.4rem;
+  border: 1px solid var(--accent);
+  border-radius: var(--r-lg);
+  background: linear-gradient(135deg, rgba(112, 0, 255, 0.12), transparent 70%);
+}
+
+.escalate-copy { flex: 1 1 22rem; }
+.escalate-copy .body { margin: 0.4rem 0 0.5rem; }
+.escalate-copy .caption { margin: 0; }
+.escalate .btn { flex: 0 0 auto; }
+
+@media (max-width: 40rem) {
+  .escalate .btn { width: 100%; }
+}
+
 /* The two detection levels, shown while they run. Level 1 answers in a
    couple of seconds and Level 2 can take ninety, so the point of this strip
    is that the wait is legible: which level is working, and what the fast one

@@ -30,10 +30,37 @@ function Section({ title, note, children }) {
 }
 
 const MODE_LABEL = {
-  ai: 'AI detection', audio: 'Audio analysis', full: 'Complete report',
+  screen: 'Quick check', ai: 'Full check',
+  audio: 'Audio analysis', full: 'Complete report',
 }
 
-export default function Report({ report, onReset }) {
+/** Offered after a quick check that could not settle the track.
+ *
+ * The service says a closer pass would help; whether to spend the minute is
+ * the user's call, so it is a button rather than something that already
+ * happened. The wording avoids implying the first answer was wrong - it was
+ * not, it was just not conclusive.
+ */
+function EscalateCard({ onEscalate, busy }) {
+  return (
+    <div className="escalate">
+      <div className="escalate-copy">
+        <p className="eyebrow">This one is worth a closer look</p>
+        <p className="body">
+          The quick check could not settle this track with confidence. A
+          closer pass listens across the whole thing rather than sampling it,
+          and returns a verdict you can act on.
+        </p>
+        <p className="caption">Takes about a minute. Your file is already uploaded.</p>
+      </div>
+      <button className="btn btn--solid" onClick={onEscalate} disabled={busy}>
+        {busy ? 'Taking a closer look…' : 'Run the closer check'}
+      </button>
+    </div>
+  )
+}
+
+export default function Report({ report, onReset, canEscalate, onEscalate, escalating }) {
   // Defaulted, not destructured bare: a Level-1-only result is a legitimate
   // answer and carries no `source` block, and reading through an undefined
   // here took the whole page down rather than degrading one line of it.
@@ -103,6 +130,10 @@ export default function Report({ report, onReset }) {
       )}
 
       {hasAi && <Verdict report={report} />}
+
+      {canEscalate && (
+        <EscalateCard onEscalate={onEscalate} busy={escalating} />
+      )}
 
       {report.artist && (
         <Section title="For the artist"

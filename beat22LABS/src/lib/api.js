@@ -196,6 +196,24 @@ export async function analyse(file, {
   throw new Error('The analysis is taking longer than expected. Try a shorter track.')
 }
 
+/** Take a track the quick check could not settle to the closer pass.
+ *
+ * The same call `detect` makes when it escalates on its own, exposed so the
+ * result page can offer it as a choice. The file is re-uploaded because the
+ * quick check keeps nothing server-side: it answers in one round trip and
+ * holds no job.
+ */
+export async function escalate(file, {
+  mode = 'ai', verify = false, genre = null, signal, onStage, onProgress,
+} = {}) {
+  onStage?.({ stage: 2, status: 'running' })
+  const report = await analyse(file, { mode, verify, genre, signal, onProgress })
+  return {
+    report,
+    levels: report?.levels_run || ['level_1_screen', 'level_2_deep'],
+  }
+}
+
 /** A Stage-1 response, shaped so the report renderer can read it.
  *
  * The two tiers do not describe the file the same way: a Stage-2 report
@@ -231,7 +249,7 @@ export function asReport(s) {
  * Stage 1 settled it), and `levels` the list of what actually ran.
  */
 export async function detect(file, {
-  mode = 'ai', verify = false, genre = null, signal, onStage, onProgress,
+  mode = 'screen', verify = false, genre = null, signal, onStage, onProgress,
 } = {}) {
   // `audio` is measurement only - no detection model runs at all, so a
   // Stage-1 screen would be a wasted round trip and a verdict the caller did
@@ -253,6 +271,20 @@ export async function detect(file, {
     // configuration rather than a failure, so fall through to Stage 2 instead
     // of refusing to analyse a file the deep model can still answer for.
     onStage?.({ stage: 1, status: 'skipped', reason: e.message })
+  }
+
+  // `screen` is the user asking for the fast read and nothing more. It stops
+  // here even when the service says the track needs a closer look - that is
+  // reported back as `canEscalate` so they can choose it from the result,
+  // rather than being charged a minute of analysis they did not ask for.
+  if (mode === 'screen') {
+    if (first) onStage?.({ stage: 1, status: 'done', result: first, escalating: false })
+    return {
+      screen: first,
+      report: null,
+      levels: first?.levels_run || ['level_1_screen'],
+      canEscalate: first?.next_step === 'escalate',
+    }
   }
 
   // `full` is bought for its evidence - the per-window timeline, the
