@@ -9,7 +9,7 @@ import HeroPanels from '../visuals/HeroPanels.jsx'
 import ConfirmPopup from '../ConfirmPopup.jsx'
 import AmbientWaves from '../visuals/AmbientWaves.jsx'
 import FeaturedTool from '../FeaturedTool.jsx'
-import { detect } from '../../lib/api.js'
+import { asReport, detect } from '../../lib/api.js'
 import { useServiceStatus } from '../../lib/useServiceStatus.js'
 import Link from 'next/link'
 import { TOOLS } from '../../toolConfig.js'
@@ -110,7 +110,7 @@ export default function App() {
       // the Level-1 evidence under `detection.level_1`, plus
       // `level_agreement` comparing the two. When Stage 1 settled the track
       // there is no deep report and the screen response is the answer.
-      setResult(deep || screen)
+      setResult(deep || asReport(screen))
     } catch (e) {
       if (e.name === 'AbortError') { setPhase('idle'); return }
       setError(e.message)

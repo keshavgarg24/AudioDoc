@@ -78,15 +78,28 @@ export default function Processing({
   // Level-1 screen settles is answered in about two seconds; pacing that
   // against the deep pipeline's 77 s would hold a finished verdict back for
   // over a minute and show invented stages that never ran.
-  const settledAtLevel1 = stage?.stage === 1 && stage.status === 'done' && !stage.escalating
+  //
+  // Two ways the run can end at Level 1, and both have to collapse the list:
+  // the screen settled the track, or Level 2 turned out not to be available
+  // to this key. The second was the one that hurt - a 403 comes back almost
+  // immediately, so the answer was ready in about two seconds and the user
+  // still watched a minute of invented deep-analysis stages.
+  // Note `skipped` is deliberately not here: that means Level 1 was
+  // unavailable and Level 2 is about to run, which is the long pipeline.
+  const stoppedAtLevel1 = Boolean(
+    stage && (
+      (stage.stage === 1 && stage.status === 'done' && !stage.escalating)
+      || stage.status === 'unavailable'
+    ),
+  )
 
   const phases = useMemo(() => {
-    if (settledAtLevel1) return PIPELINES.screen
+    if (stoppedAtLevel1) return PIPELINES.screen
     const base = PIPELINES[mode] || PIPELINES.ai
     return verify && mode !== 'audio'
       ? [...base.slice(0, -1), VERIFY, base[base.length - 1]]
       : base
-  }, [mode, verify, settledAtLevel1])
+  }, [mode, verify, stoppedAtLevel1])
 
   const [elapsed, setElapsed] = useState(0)
   const started = useRef(Date.now())

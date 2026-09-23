@@ -50,6 +50,9 @@ export default function Verdict({ report }) {
   const isFake = report.prediction === 'Fake'
   const rel = report.reliability
   const detection = report.detection
+  // A Level-1 response carries a verdict and the probability split, but none
+  // of the deep evidence below.
+  const hasDeepEvidence = Boolean(rel && report.timeline)
 
   return (
     <div>
@@ -89,6 +92,11 @@ export default function Verdict({ report }) {
           <p className="body" style={{ marginTop: '1.2rem' }}>{report.summary}</p>
         </div>
 
+        {/* Everything in this panel - reliability, the per-window counts,
+            the raw logit, coverage - is Level-2 evidence. A Level-1 answer is
+            a complete answer and simply does not have it, so the panel is
+            omitted rather than rendered against undefined. */}
+        {hasDeepEvidence && (
         <div className="verdict-side">
           <div>
             <div className="meter-row" style={{ marginBottom: '0.5rem' }}>
@@ -119,9 +127,10 @@ export default function Verdict({ report }) {
                 {report.raw_logit > 0 ? '+' : ''}{num(report.raw_logit, 3)}
               </span></div>
             <div className="kv"><span className="kv-k">Coverage</span>
-              <span className="kv-v num">{pct(report.source.coverage, 0)}</span></div>
+              <span className="kv-v num">{pct(report.source?.coverage, 0)}</span></div>
           </div>
         </div>
+        )}
       </div>
     </div>
   )

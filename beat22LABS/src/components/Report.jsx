@@ -34,7 +34,12 @@ const MODE_LABEL = {
 }
 
 export default function Report({ report, onReset }) {
-  const { rhythm, source, runtime } = report
+  // Defaulted, not destructured bare: a Level-1-only result is a legitimate
+  // answer and carries no `source` block, and reading through an undefined
+  // here took the whole page down rather than degrading one line of it.
+  const { rhythm } = report
+  const source = report.source || {}
+  const runtime = report.runtime || {}
   const f = report.features || {}
   const mus = report.musical || {}
   const prod = report.production || {}
@@ -51,7 +56,18 @@ export default function Report({ report, onReset }) {
   const loud = prod.loudness, stereo = prod.stereo
   const enc = prod.encoding, sd = prod.sound_design, ready = prod.release_readiness
 
+  // Two different questions, and conflating them rendered a Level-1 answer
+  // against Level-2 fields that do not exist on it.
+  //
+  //   hasAi   - a detection verdict was reached. Both tiers produce one.
+  //   hasDeep - the Level-2 evidence is present: the per-window timeline,
+  //             the structural pass, the findings list. Only Level 2 has it.
+  //
+  // A Level-1 response carries `prediction`, so keying the deep sections on
+  // that alone asked for report.timeline.count on a payload that stops at
+  // the verdict.
   const hasAi = Boolean(report.prediction)
+  const hasDeep = Boolean(report.timeline)
   const hasAudio = Boolean(report.features || report.musical || report.production)
 
   const displayBpm = mrhythm?.bpm || rhythm?.bpm
@@ -97,7 +113,7 @@ export default function Report({ report, onReset }) {
         </Section>
       )}
 
-      {hasAi && (
+      {hasDeep && (
         <Section title="Detection findings" note="primary analysis">
           <Findings title="What the analysis found"
                     sub="Each point references a measured value shown elsewhere in this report"
@@ -114,13 +130,13 @@ export default function Report({ report, onReset }) {
         </Section>
       )}
 
-      {hasAi && (
+      {hasDeep && (
         <Section title="Verdict over time">
           <Timeline timeline={report.timeline} />
         </Section>
       )}
 
-      {hasAi && (
+      {hasDeep && (
         <Section title="Structural analysis">
           <div className="grid grid--2">
             <Heatmap structure={report.structure}

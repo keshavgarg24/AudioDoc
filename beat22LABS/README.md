@@ -6,11 +6,31 @@ The front end for this repository's API. Next.js 16, React 19, Tailwind 4.
 ./run.sh                       # http://localhost:5173, proxying to :8000
 ```
 
-The backend must be running separately:
+The backend must be running separately, from the repo root:
 
 ```bash
-uvicorn labs.application:app --port 8000   # from the repo root, PYTHONPATH=src
+PYTHONPATH=src .venv/bin/python -m uvicorn labs.application:app --port 8000
 ```
+
+**Level 2 is gated even with auth off.** `LABS_REQUIRE_AUTH` defaults to
+`false` locally, so no key is needed — but `LABS_GATE_DEEP` defaults to
+`true`, and the anonymous principal carries `screen`, `analyze` and `read`
+without `deep`. So `mode=ai` and `mode=full` answer `403
+deep_tier_forbidden` out of the box, exactly as they do for a public browser
+key. To exercise the deep tier locally:
+
+```bash
+LABS_GATE_DEEP=0 LABS_EAGER_LOAD=true \
+  PYTHONPATH=src .venv/bin/python -m uvicorn labs.application:app --port 8000
+```
+
+`LABS_EAGER_LOAD=true` loads the 1.3 GB backbone at startup. Left at
+`false` it loads lazily, and the first `mode=ai` request arrives before it is
+resident and gets `503 model_loading`.
+
+The venv must be **Python 3.11**, matching the image. `transformers==4.44.2`
+pulls a `tokenizers` wheel that does not build on 3.14, so a 3.14 venv can
+serve Level 1 and the tools but not the deep tier.
 
 ## How it talks to the API
 

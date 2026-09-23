@@ -196,6 +196,26 @@ export async function analyse(file, {
   throw new Error('The analysis is taking longer than expected. Try a shorter track.')
 }
 
+/** A Stage-1 response, shaped so the report renderer can read it.
+ *
+ * The two tiers do not describe the file the same way: a Stage-2 report
+ * carries `source.filename` and `source.duration_seconds`, while the screen
+ * carries `filename` and `duration` at the top level. That difference is API
+ * knowledge, so it is reconciled here rather than taught to every component
+ * that renders a result.
+ */
+export function asReport(s) {
+  if (!s) return null
+  return {
+    ...s,
+    source: s.source || {
+      filename: s.filename,
+      duration_seconds: s.duration,
+    },
+    runtime: s.runtime || { elapsed_seconds: s.elapsed_seconds },
+  }
+}
+
 /** The whole detection flow, both stages, in the order the service intends.
  *
  * `onStage` is called as the run moves through the levels so the UI can show
