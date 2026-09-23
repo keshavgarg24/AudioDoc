@@ -174,7 +174,22 @@ deploy/
   docker-compose.yml single-container deployment
   aws/               the production stack: 00-backend .. 07-benchmark, main.tf
 docs/                the table above
+DEPLOYMENT.md        every AWS resource, created by hand, and why each exists
+beat22LABS/          the web interface (Next.js). Deploys to Vercel, talks to
+                     this API over /v1. See beat22LABS/README.md.
+checkpoints/         LEVEL 2 weights. NOT in git - 1.2 GB + 47 MB, fetched
+                     once and mirrored to S3 by deploy/aws/03-weights.sh, then
+                     pulled onto the worker volume at boot. A clone starts
+                     empty here and that is correct.
 ```
+
+**What ships in the image and what does not.** The two Level-1 ONNX graphs
+live at `src/labs/screen/weights/` and are committed, because they are 1.2 MB
+and Level 1 must work the moment a container starts — no volume, no network
+fetch. The Level-2 checkpoints are 1.3 GB, are gitignored, and reach a worker
+from your own S3 bucket. `LABS_OFFLINE=true` in production means a missing
+checkpoint fails loudly rather than quietly pulling weights from a third
+party mid-deploy.
 
 ### Deploying
 

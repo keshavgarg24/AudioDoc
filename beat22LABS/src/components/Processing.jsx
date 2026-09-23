@@ -56,13 +56,14 @@ function LevelStrip({ stage, mode }) {
               : 'two models, two representations'}
         </span>
       </div>
-      <div className={`proc-level${stage.stage === 2 ? ' is-active' : ''}`}>
+      <div className={`proc-level${stage.stage === 2 && stage.status === 'running' ? ' is-active' : ''}${stage.status === 'unavailable' ? ' is-skipped' : ''}`}>
         <span className="proc-level-n mono">L2</span>
         <span className="proc-level-name">Deep analysis</span>
         <span className="caption">
-          {stage.stage === 2 ? 'transformer over the full track'
-            : done && !stage.escalating ? 'not needed'
-              : 'waiting'}
+          {stage.status === 'unavailable' ? 'not available to this key'
+            : stage.stage === 2 ? 'transformer over the full track'
+              : done && !stage.escalating ? 'not needed'
+                : 'waiting'}
         </span>
       </div>
     </div>

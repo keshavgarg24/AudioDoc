@@ -17,16 +17,7 @@
 // looks, because both Level-1 models only recognise generators they were
 // trained on. Their silence is not evidence.
 
-// Default: call /api on our own origin and let the rewrite in next.config.mjs
-// forward it to API_TARGET. Staying same-origin is what keeps CORS out of the
-// picture entirely.
-//
-// NEXT_PUBLIC_API_URL overrides that with an absolute backend URL, for the case
-// where the frontend is served from somewhere that cannot proxy. That path is
-// cross-origin, so the backend has to allow the frontend's origin.
-const BASE = process.env.NEXT_PUBLIC_API_URL
-  ? process.env.NEXT_PUBLIC_API_URL.replace(/\/$/, '')
-  : '/api'
+import { BASE, authHeaders } from './endpoint.js'
 
 const POLL_INTERVAL_MS = 2000
 const POLL_CEILING_MS = 10 * 60 * 1000
@@ -46,11 +37,27 @@ async function detail(res, fallback) {
 const STATUS_MESSAGES = {
   400: 'That file appears to be empty.',
   401: 'Authentication failed - check the configured API key.',
+  403: 'This key does not carry the deep scope, so the full model is not '
+    + 'available to it.',
   413: 'That file is too large.',
   415: 'That file type is not supported.',
   422: 'That audio could not be analysed.',
   429: 'Too many analyses in flight. Wait for one to finish.',
   503: 'The model is still loading. Try again shortly.',
+}
+
+/** An API failure that still knows its HTTP status.
+ *
+ * `detect` needs to tell "the deep tier is not available to this key" (403,
+ * recoverable - the Stage-1 answer still stands) apart from "the file was
+ * rejected" (415, not recoverable). A bare Error cannot carry that.
+ */
+class ApiError extends Error {
+  constructor(message, status) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+  }
 }
 
 // 429 from /v1/screen is load shedding at the instance concurrency limit, not
@@ -65,7 +72,7 @@ const SCREEN_STATUS_MESSAGES = {
 
 export async function getReady() {
   try {
-    const res = await fetch(`${BASE}/v1/ready`)
+    const res = await fetch(`${BASE}/v1/ready`, { headers: authHeaders() })
     const body = await res.json().catch(() => ({}))
     return { ok: res.ok, ...body }
   } catch {
@@ -94,14 +101,17 @@ export async function screen(file, { signal } = {}) {
 
   let res
   try {
-    res = await fetch(`${BASE}/v1/screen`, { method: 'POST', body: form, signal })
+    res = await fetch(`${BASE}/v1/screen`,
+                      { method: 'POST', body: form, signal, headers: authHeaders() })
   } catch (e) {
     if (e.name === 'AbortError') throw e
     throw new Error('Could not reach the detection service. Is the backend running?')
   }
 
   if (!res.ok) {
-    throw new Error(await detail(res, SCREEN_STATUS_MESSAGES[res.status] || 'Screening failed.'))
+    throw new ApiError(
+      await detail(res, SCREEN_STATUS_MESSAGES[res.status] || 'Screening failed.'),
+      res.status)
   }
   return res.json()
 }
@@ -124,14 +134,17 @@ export async function analyse(file, {
 
   let res
   try {
-    res = await fetch(`${BASE}/v1/analyses`, { method: 'POST', body: form, signal })
+    res = await fetch(`${BASE}/v1/analyses`,
+                      { method: 'POST', body: form, signal, headers: authHeaders() })
   } catch (e) {
     if (e.name === 'AbortError') throw e
     throw new Error('Could not reach the detection service. Is the backend running?')
   }
 
   if (!res.ok) {
-    throw new Error(await detail(res, STATUS_MESSAGES[res.status] || 'Analysis failed.'))
+    throw new ApiError(
+      await detail(res, STATUS_MESSAGES[res.status] || 'Analysis failed.'),
+      res.status)
   }
 
   const body = await res.json()
@@ -154,7 +167,8 @@ export async function analyse(file, {
 
     let poll
     try {
-      poll = await fetch(`${BASE}/v1/analyses/${id}`, { signal })
+      poll = await fetch(`${BASE}/v1/analyses/${id}`,
+                         { signal, headers: authHeaders() })
     } catch (e) {
       if (e.name === 'AbortError') throw e
       continue // a transient network blip should not kill a running job
@@ -236,7 +250,29 @@ export async function detect(file, {
   }
 
   onStage?.({ stage: 2, status: 'running' })
-  const report = await analyse(file, { mode, verify, genre, signal, onProgress })
+
+  let report
+  try {
+    report = await analyse(file, { mode, verify, genre, signal, onProgress })
+  } catch (e) {
+    // The deep tier is billable and gated on the `deep` scope, which a
+    // public browser key deliberately does not carry. That is a expected
+    // configuration rather than a fault, and throwing here would discard a
+    // Stage-1 verdict that is already on screen and still perfectly valid.
+    // Anything else - a rejected file, a dead backend - is a real failure and
+    // still propagates.
+    if (e.status === 403 && first) {
+      onStage?.({ stage: 2, status: 'unavailable', reason: e.message })
+      return {
+        screen: first,
+        report: null,
+        levels: first.levels_run || ['level_1_screen'],
+        deepUnavailable: e.message,
+      }
+    }
+    throw e
+  }
+
   return {
     screen: first,
     report,

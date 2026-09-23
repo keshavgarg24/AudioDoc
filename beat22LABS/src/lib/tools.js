@@ -5,9 +5,7 @@
 // the UI. Individual requests stay short, which is what keeps the whole thing
 // working behind a hosted proxy that caps response time.
 
-const BASE = process.env.NEXT_PUBLIC_API_URL
-  ? process.env.NEXT_PUBLIC_API_URL.replace(/\/$/, '')
-  : '/api'
+import { BASE, authHeaders } from './endpoint.js'
 
 const POLL_INTERVAL_MS = 1500
 const POLL_CEILING_MS = 10 * 60 * 1000
@@ -56,7 +54,7 @@ function sleep(ms, signal) {
 
 /** The tool catalogue, including each tool's stated accuracy and limits. */
 export async function getTools() {
-  const res = await fetch(`${BASE}/v1/tools`)
+  const res = await fetch(`${BASE}/v1/tools`, { headers: authHeaders() })
   if (!res.ok) throw new Error('Could not load the tool list.')
   return res.json()
 }
@@ -82,6 +80,7 @@ export async function runTool(slug, files, {
   let res
   try {
     res = await fetch(`${BASE}/v1/tools/${slug}`, {
+      headers: authHeaders(),
       method: 'POST', body: form, signal,
     })
   } catch (e) {
@@ -111,7 +110,8 @@ export async function runTool(slug, files, {
 
     let poll
     try {
-      poll = await fetch(`${BASE}/v1/tools/results/${id}`, { signal })
+      poll = await fetch(`${BASE}/v1/tools/results/${id}`,
+                         { signal, headers: authHeaders() })
     } catch (e) {
       if (e.name === 'AbortError') throw e
       // A transient blip should not kill a running job, but an unreachable

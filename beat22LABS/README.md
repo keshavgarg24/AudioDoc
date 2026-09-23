@@ -31,6 +31,75 @@ infrastructure and every API call 404s — a failure invisible at build time and
 total at runtime. Set `ALLOW_LOCALHOST_API_TARGET=1` for a deliberate local
 production build.
 
+## Deploying to Vercel
+
+Import the repository, set **Root Directory** to `beat22LABS`, and add the
+environment variables below. The framework preset, build command and headers
+come from `vercel.json`.
+
+| Variable | Value |
+| --- | --- |
+| `API_TARGET` | your backend's public HTTPS origin |
+| `NEXT_PUBLIC_LABS_API_KEY` | a key scoped `analyze,read` — see below |
+| `NEXT_PUBLIC_SITE_URL` | the deployed origin, for metadata and sitemap |
+
+All three are read at **build** time. Changing one in the dashboard does
+nothing until you redeploy.
+
+### The API key is public, and that is a decision
+
+The backend deploys with `LABS_REQUIRE_AUTH=true`, so every route needs an
+`X-API-Key` header. `NEXT_PUBLIC_` variables are compiled into the browser
+bundle, so this key is readable by anyone who opens devtools.
+
+That is the only option that also carries a 50 MB upload. Injecting the
+header server-side would mean proxying the body through a serverless
+function, and those cap request bodies well below what the API accepts; a
+rewrite has no such cap but cannot add headers. So the key has to come from
+the browser, which means it has to be one you can afford to publish.
+
+Mint it with `analyze,read` and nothing more:
+
+```bash
+python -m labs.cli.manage_keys create \
+  --name beat22labs-web --scopes analyze,read --quota 5000
+```
+
+`analyze` grants the free Level-1 screen and the tools. It deliberately does
+**not** grant `deep`, so the billable tier cannot be spent by strangers who
+read your bundle. Give it a daily quota, and rotate it like any other public
+credential.
+
+**What that key can and cannot do**, verified against the deployed settings:
+
+| Call | With this key |
+| --- | --- |
+| `POST /v1/screen` — Stage 1 | works |
+| `GET /v1/tools`, `POST /v1/tools/{slug}` | works |
+| `POST /v1/analyses` `mode=audio` | works |
+| `POST /v1/analyses` `mode=ai` / `mode=full` | **403 `deep_tier_forbidden`** |
+
+The 403 is expected, not a bug. `detect()` treats it as recoverable: the
+Stage-1 verdict is already on screen and stays there, with Level 2 marked
+"not available to this key", rather than the whole run failing. To enable the
+deep tier for real users, call it from a server you control with a
+`deep`-scoped key — not from the browser.
+
+### Two things to check before launch
+
+**Rate limiting is per key, and this key is shared by every visitor.** The
+deployed screen task sets `LABS_RATE_LIMIT_PER_MIN=30`, and the window is
+per container rather than per fleet. Thirty requests a minute across your
+whole audience is low for a public site: raise it for this key's deployment,
+or move to per-user keys, before you send traffic.
+
+**Confirm the upload path carries 50 MB.** The `/api/*` rewrite is resolved
+by Vercel's proxy rather than by a function, which is why it is used for
+uploads instead of a route handler. Upload a large file to the deployed site
+once and confirm it succeeds rather than assuming it — if it fails, the
+fallback is `NEXT_PUBLIC_API_URL` pointing straight at the backend, which
+then needs your origin in `LABS_CORS_ORIGINS`.
+
 ## The detection flow
 
 Detection is two levels and they are two different endpoints, because they
