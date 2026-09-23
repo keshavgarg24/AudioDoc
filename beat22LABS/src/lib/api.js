@@ -1,0 +1,245 @@
+// Client for the detection API.
+//
+// Detection runs in two levels and they are two different endpoints, because
+// they have two different shapes:
+//
+//   Stage 1  POST /v1/screen    synchronous, 1-3 s, free
+//   Stage 2  POST /v1/analyses  202 + poll, 22-90 s, billable
+//
+// Stage 1 answers inside a normal HTTP timeout, so the browser calls it
+// directly and shows a verdict almost immediately. Stage 2 cannot: any hosted
+// proxy in front of this closes an idle connection long before 90 s, so it is
+// submit-and-poll with every individual request under a second.
+//
+// `next_step` on the Stage-1 response is the field that decides whether Stage
+// 2 runs. It is not a confidence heuristic of ours - the service computes it,
+// and a Stage-1 `human-made` always says `escalate` however confident it
+// looks, because both Level-1 models only recognise generators they were
+// trained on. Their silence is not evidence.
+
+// Default: call /api on our own origin and let the rewrite in next.config.mjs
+// forward it to API_TARGET. Staying same-origin is what keeps CORS out of the
+// picture entirely.
+//
+// NEXT_PUBLIC_API_URL overrides that with an absolute backend URL, for the case
+// where the frontend is served from somewhere that cannot proxy. That path is
+// cross-origin, so the backend has to allow the frontend's origin.
+const BASE = process.env.NEXT_PUBLIC_API_URL
+  ? process.env.NEXT_PUBLIC_API_URL.replace(/\/$/, '')
+  : '/api'
+
+const POLL_INTERVAL_MS = 2000
+const POLL_CEILING_MS = 10 * 60 * 1000
+
+async function detail(res, fallback) {
+  try {
+    const b = await res.json()
+    // Current envelope: {"error": {"code", "message"}}.
+    if (b.error?.message) return b.error.message
+    // Older shape, kept as a fallback for safety.
+    if (typeof b.detail === 'string') return b.detail
+    if (Array.isArray(b.detail)) return b.detail[0]?.msg || fallback
+  } catch { /* non-JSON error body */ }
+  return fallback
+}
+
+const STATUS_MESSAGES = {
+  400: 'That file appears to be empty.',
+  401: 'Authentication failed - check the configured API key.',
+  413: 'That file is too large.',
+  415: 'That file type is not supported.',
+  422: 'That audio could not be analysed.',
+  429: 'Too many analyses in flight. Wait for one to finish.',
+  503: 'The model is still loading. Try again shortly.',
+}
+
+// 429 from /v1/screen is load shedding at the instance concurrency limit, not
+// a rate limit, and the documented response is to retry immediately rather
+// than to back off. Saying "too many in flight" there sends people away from
+// a request that would have succeeded on the next attempt.
+const SCREEN_STATUS_MESSAGES = {
+  ...STATUS_MESSAGES,
+  429: 'Every screening slot is busy. Try again in a moment.',
+  503: 'The Level-1 screen is not enabled on this deployment.',
+}
+
+export async function getReady() {
+  try {
+    const res = await fetch(`${BASE}/v1/ready`)
+    const body = await res.json().catch(() => ({}))
+    return { ok: res.ok, ...body }
+  } catch {
+    return { ok: false, ready: false, status: 'offline' }
+  }
+}
+
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(resolve, ms)
+    signal?.addEventListener('abort', () => {
+      clearTimeout(t)
+      reject(new DOMException('Aborted', 'AbortError'))
+    }, { once: true })
+  })
+}
+
+/** Stage 1. Two small models, synchronous, no job id.
+ *
+ * Resolves with the full screen response. `next_step` is `return` when the
+ * verdict is decisive and `escalate` when only the deep model can settle it.
+ */
+export async function screen(file, { signal } = {}) {
+  const form = new FormData()
+  form.append('file', file)
+
+  let res
+  try {
+    res = await fetch(`${BASE}/v1/screen`, { method: 'POST', body: form, signal })
+  } catch (e) {
+    if (e.name === 'AbortError') throw e
+    throw new Error('Could not reach the detection service. Is the backend running?')
+  }
+
+  if (!res.ok) {
+    throw new Error(await detail(res, SCREEN_STATUS_MESSAGES[res.status] || 'Screening failed.'))
+  }
+  return res.json()
+}
+
+/** Stage 2. Submit a track and resolve with the finished report.
+ *
+ * `onProgress` receives the backend's own stage label ("analysing",
+ * "verification", "storing", ...) so the UI can reflect real work rather than
+ * a guessed timeline.
+ */
+export async function analyse(file, {
+  mode = 'ai', verify = false, genre = null, signal, onProgress,
+} = {}) {
+  const form = new FormData()
+  form.append('file', file)
+  form.append('mode', mode)
+  // The v1 API takes an escalation policy, not a boolean.
+  form.append('verify', verify ? 'always' : 'never')
+  if (genre) form.append('genre', genre)
+
+  let res
+  try {
+    res = await fetch(`${BASE}/v1/analyses`, { method: 'POST', body: form, signal })
+  } catch (e) {
+    if (e.name === 'AbortError') throw e
+    throw new Error('Could not reach the detection service. Is the backend running?')
+  }
+
+  if (!res.ok) {
+    throw new Error(await detail(res, STATUS_MESSAGES[res.status] || 'Analysis failed.'))
+  }
+
+  const body = await res.json()
+
+  // 200 rather than 202 means a stored result for byte-identical audio in the
+  // same mode already existed. There is no job to poll: the body IS the
+  // result, and treating it as an acceptance would hang waiting for an id
+  // that is never coming.
+  if (res.status === 200 && !body.id) return body
+  if (body.cached && body.mode) return body
+
+  const { id } = body
+  if (!id) throw new Error('The service accepted the file but returned no job id.')
+
+  const deadline = Date.now() + POLL_CEILING_MS
+  let lastStage = null
+
+  while (Date.now() < deadline) {
+    await sleep(POLL_INTERVAL_MS, signal)
+
+    let poll
+    try {
+      poll = await fetch(`${BASE}/v1/analyses/${id}`, { signal })
+    } catch (e) {
+      if (e.name === 'AbortError') throw e
+      continue // a transient network blip should not kill a running job
+    }
+
+    if (!poll.ok) {
+      if (poll.status === 404) throw new Error('That analysis is no longer available.')
+      continue
+    }
+
+    const polled = await poll.json().catch(() => null)
+    if (!polled) continue
+
+    if (polled.progress && polled.progress !== lastStage) {
+      lastStage = polled.progress
+      onProgress?.(polled.progress)
+    }
+
+    if (polled.status === 'succeeded') return polled.result
+    if (polled.status === 'failed') {
+      throw new Error(polled.error?.message || 'Analysis failed.')
+    }
+  }
+
+  throw new Error('The analysis is taking longer than expected. Try a shorter track.')
+}
+
+/** The whole detection flow, both stages, in the order the service intends.
+ *
+ * `onStage` is called as the run moves through the levels so the UI can show
+ * a Stage-1 answer while Stage 2 is still running, rather than a spinner for
+ * the full 90 seconds:
+ *
+ *   onStage({ stage: 1, status: 'running' })
+ *   onStage({ stage: 1, status: 'done', result, escalating: true })
+ *   onStage({ stage: 2, status: 'running' })
+ *
+ * Returns `{ screen, report, levels }` - `screen` is the Stage-1 response (or
+ * null when Stage 1 was skipped), `report` the Stage-2 result (or null when
+ * Stage 1 settled it), and `levels` the list of what actually ran.
+ */
+export async function detect(file, {
+  mode = 'ai', verify = false, genre = null, signal, onStage, onProgress,
+} = {}) {
+  // `audio` is measurement only - no detection model runs at all, so a
+  // Stage-1 screen would be a wasted round trip and a verdict the caller did
+  // not ask for.
+  if (mode === 'audio') {
+    onStage?.({ stage: 2, status: 'running' })
+    const report = await analyse(file, { mode, verify, genre, signal, onProgress })
+    return { screen: null, report, levels: ['audio'] }
+  }
+
+  onStage?.({ stage: 1, status: 'running' })
+
+  let first = null
+  try {
+    first = await screen(file, { signal })
+  } catch (e) {
+    if (e.name === 'AbortError') throw e
+    // A deployment with LABS_SCREEN=0 has no Stage 1. That is a valid
+    // configuration rather than a failure, so fall through to Stage 2 instead
+    // of refusing to analyse a file the deep model can still answer for.
+    onStage?.({ stage: 1, status: 'skipped', reason: e.message })
+  }
+
+  // `full` is bought for its evidence - the per-window timeline, the
+  // musicological pass - so it never short-circuits, however decisive Stage 1
+  // was. `ai` stops as soon as the service says the answer is settled.
+  const settled = first?.next_step === 'return'
+  const escalating = mode === 'full' || !settled
+
+  if (first) {
+    onStage?.({ stage: 1, status: 'done', result: first, escalating })
+  }
+
+  if (!escalating) {
+    return { screen: first, report: null, levels: first?.levels_run || ['level_1_screen'] }
+  }
+
+  onStage?.({ stage: 2, status: 'running' })
+  const report = await analyse(file, { mode, verify, genre, signal, onProgress })
+  return {
+    screen: first,
+    report,
+    levels: report?.levels_run || ['level_1_screen', 'level_2_deep'],
+  }
+}

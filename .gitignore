@@ -89,3 +89,13 @@ deploy/aws/.weights-digests
 
 # Terraform plan files embed variable values, including secrets.
 tfplan-*
+
+# Frontend (beat22LABS). Dependencies and build output only - the source is
+# committed. Anchored to that directory so these names cannot swallow
+# anything under src/, which is the mistake the bare `audio` pattern above
+# used to make.
+/beat22LABS/node_modules/
+/beat22LABS/.next/
+/beat22LABS/out/
+/beat22LABS/.turbo/
+/beat22LABS/next-env.d.ts
