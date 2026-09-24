@@ -53,38 +53,60 @@ const CAPABILITIES = [
 ]
 
 export default function App() {
-  const saved = useRef(loadSaved())
   // Shared with the header: one poll loop for the whole app.
   const status = useServiceStatus()
   const [mode, setMode] = useState('screen')
   const [verify, setVerify] = useState(false)
-  const [phase, setPhase] = useState(saved.current ? 'done' : 'idle')
+  // Deliberately NOT seeded from sessionStorage during render. The server has
+  // no sessionStorage, so seeding here made the server render the hero and
+  // the client render a stored report - a hydration mismatch that React
+  // resolves by throwing the whole tree away and rebuilding it. The restore
+  // happens in an effect below, after mount, where the two agree.
+  const [phase, setPhase] = useState('idle')
   const [file, setFile] = useState(null)
-  const [report, setReport] = useState(saved.current)
+  const [report, setReport] = useState(null)
   const [error, setError] = useState(null)
   const [pendingFile, setPendingFile] = useState(null)
   const [isMinimized, setIsMinimized] = useState(false)
 
   const [result, setResult] = useState(null)
-  const [phasesDone, setPhasesDone] = useState(false)
   // What the two levels are doing right now. Stage 1 answers in a couple of
   // seconds, so its verdict is shown while Stage 2 is still running rather
   // than holding a bare spinner for the full 90 s.
   const [stage, setStage] = useState(null)
+  // The service's own stage label, straight off the poll response. The step
+  // display is clamped to it so it can never run ahead of the work.
+  const [progress, setProgress] = useState(null)
   // Set when the quick check could not settle the track. The deeper pass is
   // then offered on the result rather than run automatically.
   const [canEscalate, setCanEscalate] = useState(false)
   const [escalating, setEscalating] = useState(false)
+  // The mode actually executing, which is not always the one selected: an
+  // escalation runs the deep pass while the selection still reads `screen`.
+  // Deriving the step list from `escalating` instead conflated "busy" with
+  // "running the deep pass", so an audio run from the result page showed the
+  // deep pipeline's steps.
+  const [runningMode, setRunningMode] = useState(null)
   const abortRef = useRef(null)
 
+  // Restore a report from a previous visit, once, after mount.
   useEffect(() => {
-    if (phase === 'working' && result && phasesDone) {
+    const saved = loadSaved()
+    if (saved) { setReport(saved); setPhase('done') }
+  }, [])
+
+  // Gated on the answer alone. It used to also wait for every step of a
+  // time-paced animation to play out, which held a finished report back by
+  // up to a minute; the steps are clamped to the service's real stage now,
+  // so there is nothing left for them to gate.
+  useEffect(() => {
+    if (phase === 'working' && result) {
       setReport(result)
       saveReport(result)
       setPhase('done')
       window.scrollTo({ top: 0, behavior: 'smooth' })
     }
-  }, [phase, result, phasesDone])
+  }, [phase, result])
 
   const handleFilePicked = useCallback((f) => {
     setPendingFile(f)
@@ -99,9 +121,10 @@ export default function App() {
     setReport(null)
     clearSaved()
     setResult(null)
-    setPhasesDone(false)
     setStage(null)
+    setProgress(null)
     setCanEscalate(false)
+    setRunningMode(mode)
     setPhase('working')
     setIsMinimized(false)
 
@@ -109,7 +132,8 @@ export default function App() {
     abortRef.current = ctrl
     try {
       const { screen, report: deep, canEscalate: more } = await detect(f, {
-        mode, verify, signal: ctrl.signal, onStage: setStage,
+        mode, verify, signal: ctrl.signal,
+        onStage: setStage, onProgress: setProgress,
       })
       setCanEscalate(Boolean(more))
       // Stage 2 supersedes Stage 1 when it ran: its response already carries
@@ -138,8 +162,9 @@ export default function App() {
     // analysis with no progress, no elapsed time and no way to cancel - the
     // one part of the run where the wait is longest.
     setResult(null)
-    setPhasesDone(false)
     setStage(null)
+    setProgress(null)
+    setRunningMode('ai')
     setPhase('working')
     setIsMinimized(false)
     window.scrollTo({ top: 0, behavior: 'smooth' })
@@ -148,7 +173,8 @@ export default function App() {
     abortRef.current = ctrl
     try {
       const { report: deep } = await escalate(file, {
-        mode: 'ai', verify, signal: ctrl.signal, onStage: setStage,
+        mode: 'ai', verify, signal: ctrl.signal,
+        onStage: setStage, onProgress: setProgress,
       })
       setResult(deep)
     } catch (e) {
@@ -168,10 +194,47 @@ export default function App() {
     }
   }, [file, verify, escalating])
 
+  // Run a different analysis on the file already in hand. Same working view
+  // and the same progress plumbing as a fresh upload - the only difference
+  // is that nothing has to be uploaded again from the user's side.
+  const runOnSameFile = useCallback(async (nextMode) => {
+    if (!file || escalating) return
+    setEscalating(true)
+    setError(null)
+    setCanEscalate(false)
+    setResult(null)
+    setStage(null)
+    setProgress(null)
+    setMode(nextMode)
+    setRunningMode(nextMode)
+    setPhase('working')
+    setIsMinimized(false)
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+
+    const ctrl = new AbortController()
+    abortRef.current = ctrl
+    try {
+      const { screen, report: deep, canEscalate: more } = await detect(file, {
+        mode: nextMode, verify, signal: ctrl.signal,
+        onStage: setStage, onProgress: setProgress,
+      })
+      setCanEscalate(Boolean(more))
+      setResult(deep || asReport(screen))
+    } catch (e) {
+      if (e.name === 'AbortError') { setPhase('done'); return }
+      setError(e.message)
+      setPhase('done')
+    } finally {
+      setEscalating(false)
+      abortRef.current = null
+    }
+  }, [file, verify, escalating])
+
   const reset = () => {
     setPhase('idle'); setReport(null); setResult(null)
-    setPhasesDone(false); setFile(null); setError(null)
-    setIsMinimized(false); setStage(null); setCanEscalate(false)
+    setFile(null); setError(null)
+    setIsMinimized(false); setStage(null); setProgress(null)
+    setCanEscalate(false)
     clearSaved()
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }
@@ -276,11 +339,11 @@ export default function App() {
             to be the deep ones. */}
         {phase === 'working' && !isMinimized && (
           <Processing filename={file?.name || 'audio'}
-                      mode={escalating ? 'ai' : mode} verify={verify}
+                      mode={runningMode || mode} verify={verify}
                       stage={stage}
                       onCancel={() => abortRef.current?.abort()}
                       onHide={() => setIsMinimized(true)}
-                      onPhasesDone={() => setPhasesDone(true)} />
+                      progress={progress} />
         )}
 
         {phase === 'working' && isMinimized && (
@@ -296,7 +359,8 @@ export default function App() {
         {phase === 'done' && report && (
           <Report report={report} onReset={reset}
                   canEscalate={canEscalate} onEscalate={runEscalation}
-                  escalating={escalating} />
+                  escalating={escalating}
+                  onRunMode={file ? runOnSameFile : null} running={escalating} />
         )}
 
         {pendingFile && (

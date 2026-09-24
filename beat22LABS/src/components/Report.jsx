@@ -60,7 +60,52 @@ function EscalateCard({ onEscalate, busy }) {
   )
 }
 
-export default function Report({ report, onReset, canEscalate, onEscalate, escalating }) {
+/* What else can be run on the same file, offered once a report exists.
+ *
+ * Someone who has just had an origin verdict often wants the production
+ * numbers too, and re-uploading the same track to get them is friction with
+ * no purpose - the file is already in hand. Only the runs that would add
+ * something are shown: a report that already carries the measurements does
+ * not offer to measure again. */
+const ALSO_RUN = [
+  { mode: 'audio', label: 'Audio analysis', time: 'under a minute',
+    desc: 'Tempo, key, groove, loudness and whether the master is ready.',
+    needs: (r) => !r.features && !r.musical && !r.production },
+  { mode: 'full', label: 'Complete report', time: '2 to 3 min',
+    desc: 'The origin check and the full production breakdown in one document.',
+    needs: (r) => r.mode !== 'full' },
+]
+
+function AlsoRun({ report, onRun, busy }) {
+  const offers = ALSO_RUN.filter((o) => o.needs(report))
+  if (!offers.length) return null
+
+  return (
+    <Section title="More on this track" note="same file, nothing to re-upload">
+      <div className="alsorun">
+        {offers.map((o) => (
+          <div key={o.mode} className="alsorun-card">
+            <div>
+              <p className="alsorun-label">{o.label}</p>
+              <p className="caption">{o.desc}</p>
+            </div>
+            <div className="alsorun-foot">
+              <span className="caption mono">{o.time}</span>
+              <button className="btn btn--sm" disabled={busy}
+                      onClick={() => onRun(o.mode)}>
+                Run
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </Section>
+  )
+}
+
+export default function Report({
+  report, onReset, canEscalate, onEscalate, escalating, onRunMode, running,
+}) {
   // Defaulted, not destructured bare: a Level-1-only result is a legitimate
   // answer and carries no `source` block, and reading through an undefined
   // here took the whole page down rather than degrading one line of it.
@@ -133,6 +178,10 @@ export default function Report({ report, onReset, canEscalate, onEscalate, escal
 
       {canEscalate && (
         <EscalateCard onEscalate={onEscalate} busy={escalating} />
+      )}
+
+      {onRunMode && (
+        <AlsoRun report={report} onRun={onRunMode} busy={escalating || running} />
       )}
 
       {report.artist && (

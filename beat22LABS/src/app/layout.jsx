@@ -5,6 +5,7 @@
 // object across the whole site instead of seven that drift apart. This is the
 // direct replacement for the old react-router `Layout` route element.
 
+import Script from 'next/script'
 import { Inter } from 'next/font/google'
 import SiteHeader from '../components/layout/SiteHeader.jsx'
 import SiteFooter from '../components/layout/SiteFooter.jsx'
@@ -75,12 +76,15 @@ const SILENCE_EXTENSION_ERRORS = `
 export default function RootLayout({ children }) {
   return (
     <html lang="en" data-theme="dark" className={inter.variable}>
-      <head>
-        {/* Installed before anything else runs, since an extension can fail
-            before React has mounted. */}
-        <script dangerouslySetInnerHTML={{ __html: SILENCE_EXTENSION_ERRORS }} />
-      </head>
       <body>
+        {/* next/script, not a bare <script>: React does not execute script
+            tags rendered as component children, so writing one here produced
+            a console error and a dead handler. `beforeInteractive` is the
+            one strategy that runs early enough to catch an extension that
+            fails before hydration. */}
+        <Script id="silence-extension-errors" strategy="beforeInteractive">
+          {SILENCE_EXTENSION_ERRORS}
+        </Script>
         <ScrollToTop />
         <div className="site">
           <a href="#main" className="skip-link">Skip to content</a>

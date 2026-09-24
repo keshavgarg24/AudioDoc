@@ -3,34 +3,57 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { clock } from '../lib/format.js'
 
-/* Phase list per analysis mode. `secs` paces the indicator; the report is
-   gated on BOTH the response arriving and every phase having been displayed,
-   so no step is ever skipped. */
-const DECODE = { name: 'Cracking the seal', tech: 'decode to 24 kHz mono', secs: 5, viz: 'bars' }
-const BEATS = { name: 'Finding the pulse', tech: 'beat and downbeat tracking', secs: 14, viz: 'pulse' }
-const SLICE = { name: 'Slicing the evidence', tech: '48 beat aligned windows', secs: 5, viz: 'cells' }
-const STAGE1 = { name: 'Reading the fingerprints', tech: 'acoustic signature', secs: 46, viz: 'scan' }
-const STAGE2 = { name: 'Cross examining', tech: 'weighing the evidence', secs: 7, viz: 'merge' }
-const SPECTRAL = { name: 'Mapping the spectrum', tech: 'band and ceiling analysis', secs: 11, viz: 'spectrum' }
-const GROOVE = { name: 'Feeling the groove', tech: 'grid, swing and drum voices', secs: 12, viz: 'grid' }
-const HARMONY = { name: 'Naming the key', tech: 'chroma and chord templates', secs: 9, viz: 'chroma' }
-const MASTER = { name: 'Metering the master', tech: 'LUFS, true peak and stereo', secs: 8, viz: 'meter' }
-const VERIFY = { name: 'Running deeper verification', tech: 'cross-checking the result', secs: 18, viz: 'verify' }
-const COMPILE = { name: 'Building the case file', tech: 'assembling the report', secs: 4, viz: 'compile' }
+/* The step list, and which of the service's own stages each step belongs to.
 
-/* Level 1 only. Two small ONNX graphs over a decoded file, measured at
-   1.07-3.20 s end to end, so this pipeline is paced in seconds rather than
-   tens of them. It is selected at runtime, the moment the service says the
-   screen settled the track - see `phases` below. */
-const L1_DECODE = { name: 'Cracking the seal', tech: 'decode to 24 kHz mono', secs: 1, viz: 'bars' }
-const L1_MODELS = { name: 'Reading the fingerprints', tech: 'two models, two representations', secs: 2, viz: 'scan' }
-const L1_FUSE = { name: 'Fusing the opinions', tech: 'agreement raises confidence', secs: 1, viz: 'merge' }
+   The service reports four stages and no more: `screening` while the quick
+   check runs, `analysing` for the whole deep pass, then `storing` and
+   `finalising`. `analysing` alone covers forty to ninety seconds, so showing
+   it as one step left the longest part of the wait looking frozen.
+
+   So each step declares the stage it belongs to, and the display advances
+   through the steps of the *current* stage on a timer while refusing to
+   leave that stage until the service actually moves on. The effect is a
+   progression that reads as fine-grained but can never claim to have
+   finished work that is still running - which is what the old purely
+   time-paced list did, sometimes completing every step a full minute before
+   the answer arrived.
+
+   `secs` is only the dwell time on a step within its stage, never a promise
+   about the whole run. */
+const STAGE_ORDER = ['queued', 'starting', 'screening', 'analysing', 'storing', 'finalising', 'complete']
+const stageRank = (s) => {
+  const i = STAGE_ORDER.indexOf(s)
+  return i === -1 ? 0 : i
+}
+
+const DECODE = { name: 'Cracking the seal', tech: 'decode to 24 kHz mono', secs: 4, viz: 'bars', stage: 'screening' }
+const BEATS = { name: 'Finding the pulse', tech: 'beat and downbeat tracking', secs: 10, viz: 'pulse', stage: 'analysing' }
+const SLICE = { name: 'Slicing the evidence', tech: 'beat aligned windows', secs: 6, viz: 'cells', stage: 'analysing' }
+// The deep pass, broken out. One 46-second step here read as a hang.
+const EMBED = { name: 'Listening window by window', tech: 'across the whole track', secs: 14, viz: 'scan', stage: 'analysing' }
+const SCORE = { name: 'Scoring each window', tech: 'per-window verdicts', secs: 14, viz: 'cells', stage: 'analysing' }
+const SEQUENCE = { name: 'Reading the sequence', tech: 'how the windows relate', secs: 12, viz: 'merge', stage: 'analysing' }
+const STAGE2 = { name: 'Weighing the evidence', tech: 'one verdict from many windows', secs: 10, viz: 'merge', stage: 'analysing' }
+const SPECTRAL = { name: 'Mapping the spectrum', tech: 'band and ceiling analysis', secs: 9, viz: 'spectrum', stage: 'analysing' }
+const GROOVE = { name: 'Feeling the groove', tech: 'grid, swing and drum voices', secs: 9, viz: 'grid', stage: 'analysing' }
+const HARMONY = { name: 'Naming the key', tech: 'chroma and chord templates', secs: 8, viz: 'chroma', stage: 'analysing' }
+const MASTER = { name: 'Metering the master', tech: 'LUFS, true peak and stereo', secs: 8, viz: 'meter', stage: 'analysing' }
+const VERIFY = { name: 'Cross-checking the result', tech: 'a second opinion', secs: 14, viz: 'verify', stage: 'analysing' }
+const COMPILE = { name: 'Building the case file', tech: 'assembling the report', secs: 4, viz: 'compile', stage: 'storing' }
+
+/* Level 1 only: measured at 1.07-3.20 s end to end, so this list is paced in
+   seconds rather than tens of them. Selected the moment the service says the
+   quick check settled the track - see `phases` below. */
+const L1_DECODE = { name: 'Cracking the seal', tech: 'decode to 24 kHz mono', secs: 1, viz: 'bars', stage: 'screening' }
+const L1_MODELS = { name: 'Reading the fingerprints', tech: 'two listens, two ways', secs: 2, viz: 'scan', stage: 'screening' }
+const L1_FUSE = { name: 'Fusing the opinions', tech: 'agreement raises confidence', secs: 1, viz: 'merge', stage: 'screening' }
 
 export const PIPELINES = {
   screen: [L1_DECODE, L1_MODELS, L1_FUSE],
-  ai: [DECODE, BEATS, SLICE, STAGE1, STAGE2, COMPILE],
+  ai: [DECODE, BEATS, SLICE, EMBED, SCORE, SEQUENCE, STAGE2, COMPILE],
   audio: [DECODE, BEATS, SPECTRAL, GROOVE, HARMONY, MASTER, COMPILE],
-  full: [DECODE, BEATS, SLICE, STAGE1, STAGE2, SPECTRAL, GROOVE, HARMONY, MASTER, COMPILE],
+  full: [DECODE, BEATS, SLICE, EMBED, SCORE, SEQUENCE, STAGE2,
+         SPECTRAL, GROOVE, HARMONY, MASTER, COMPILE],
 }
 
 /* Which of the two detection levels is running, and what Level 1 concluded.
@@ -71,21 +94,12 @@ function LevelStrip({ stage, mode }) {
 }
 
 export default function Processing({
-  filename, mode, verify, stage, onCancel, onHide, onPhasesDone,
+  filename, mode, verify, stage, progress, onCancel, onHide,
 }) {
-  // The report is gated on every phase having been displayed, so the phase
-  // list has to match the work that is actually going to happen. A track the
-  // Level-1 screen settles is answered in about two seconds; pacing that
-  // against the deep pipeline's 77 s would hold a finished verdict back for
-  // over a minute and show invented stages that never ran.
-  //
-  // Two ways the run can end at Level 1, and both have to collapse the list:
-  // the screen settled the track, or Level 2 turned out not to be available
-  // to this key. The second was the one that hurt - a 403 comes back almost
-  // immediately, so the answer was ready in about two seconds and the user
-  // still watched a minute of invented deep-analysis stages.
-  // Note `skipped` is deliberately not here: that means Level 1 was
-  // unavailable and Level 2 is about to run, which is the long pipeline.
+  // Two ways the run ends at Level 1, and both collapse the list: the quick
+  // check settled the track, or the deeper pass is not available to this key.
+  // `skipped` is deliberately not here - that means Level 1 was unavailable
+  // and the deep pass is about to run, which is the long list.
   const stoppedAtLevel1 = Boolean(
     stage && (
       (stage.stage === 1 && stage.status === 'done' && !stage.escalating)
@@ -103,13 +117,9 @@ export default function Processing({
 
   const [elapsed, setElapsed] = useState(0)
   const started = useRef(Date.now())
-  const notified = useRef(false)
-
-  const total = useMemo(() => phases.reduce((a, p) => a + p.secs, 0), [phases])
 
   useEffect(() => {
     started.current = Date.now()
-    notified.current = false
     setElapsed(0)
   }, [mode, verify])
 
@@ -120,26 +130,37 @@ export default function Processing({
     return () => clearInterval(id)
   }, [])
 
-  // Work out which phase is showing, and whether the whole sequence has run.
+  // How far the SERVICE says we are. Until the first poll comes back this is
+  // `queued`, which allows nothing past the first step - so the display can
+  // never run ahead of work that has not started.
+  const reached = stageRank(progress || 'queued')
+
+  // The last step the service's own stage permits. Everything after it is
+  // work that demonstrably has not happened yet.
+  let ceiling = 0
+  for (let i = 0; i < phases.length; i++) {
+    if (stageRank(phases[i].stage) <= reached) ceiling = i
+  }
+  // `complete` means the answer is in hand, so every step is legitimately done.
+  const finished = reached >= stageRank('complete')
+
+  // Within what the service permits, walk the steps on their own dwell times
+  // so a forty-second stage reads as movement rather than a freeze. The walk
+  // is clamped to `ceiling`: it can look busy, it cannot claim to have
+  // finished something still running.
   let acc = 0
-  let current = phases.length - 1
-  let done = true
+  let timed = phases.length - 1
   for (let i = 0; i < phases.length; i++) {
     acc += phases[i].secs
-    if (elapsed < acc) { current = i; done = false; break }
+    if (elapsed < acc) { timed = i; break }
   }
+  const current = finished ? phases.length - 1 : Math.min(timed, ceiling)
 
-  useEffect(() => {
-    if (done && !notified.current) {
-      notified.current = true
-      onPhasesDone?.()
-    }
-  }, [done, onPhasesDone])
-
-  let before = 0
-  for (let i = 0; i < current; i++) before += phases[i].secs
-  const within = Math.min(1, Math.max(0, (elapsed - before) / phases[current].secs))
-  const overall = Math.min(100, (elapsed / total) * 100)
+  // Progress reads off the steps actually cleared, not off a stopwatch, so it
+  // cannot sit at 100% while the analysis is still going.
+  const overall = finished
+    ? 100
+    : Math.min(99, Math.round((current / Math.max(1, phases.length)) * 100))
 
   return (
     <div className="proc">
@@ -147,7 +168,7 @@ export default function Processing({
         <p className="eyebrow">Analysis in progress</p>
         <h2 className="proc-file">{filename}</h2>
         <p className="caption">
-          {phases.length} stages. Results appear once every stage has completed.
+          {phases.length} steps. The report appears the moment the answer does.
         </p>
       </div>
 
@@ -157,7 +178,7 @@ export default function Processing({
         {phases.map((p, i) => (
           <div key={p.name} className="prog-seg">
             <div className="prog-seg-fill"
-                 style={{ transform: `scaleX(${i < current ? 1 : i === current ? within : 0})` }} />
+                 style={{ transform: `scaleX(${i < current ? 1 : i === current ? 0.5 : 0})` }} />
           </div>
         ))}
       </div>

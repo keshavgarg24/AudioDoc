@@ -207,6 +207,7 @@ export async function escalate(file, {
   mode = 'ai', verify = false, genre = null, signal, onStage, onProgress,
 } = {}) {
   onStage?.({ stage: 2, status: 'running' })
+  onProgress?.('starting')
   const report = await analyse(file, { mode, verify, genre, signal, onProgress })
   return {
     report,
@@ -256,11 +257,13 @@ export async function detect(file, {
   // not ask for.
   if (mode === 'audio') {
     onStage?.({ stage: 2, status: 'running' })
+    onProgress?.('starting')
     const report = await analyse(file, { mode, verify, genre, signal, onProgress })
     return { screen: null, report, levels: ['audio'] }
   }
 
   onStage?.({ stage: 1, status: 'running' })
+  onProgress?.('screening')
 
   let first = null
   try {
