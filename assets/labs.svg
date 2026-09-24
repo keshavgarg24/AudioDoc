@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
-     viewBox="0 0 1230 300" width="1230" height="300">
+     viewBox="0 0 1365 300" width="1365" height="300">
 <style type="text/css">
 	.st0{fill:#FFFFFF;}
 	.st1{fill:url(#SVGID_1_);}
@@ -141,8 +141,8 @@
 <!-- Set as text rather than drawn letterforms. The decorative version (an
      equalizer L, a play-triangle A, vinyl-bowl B, sound-wave S) read as a
      logo of its own next to the beat22 mark; plain type reads as one name. -->
-<text x="740" y="230"
+<text x="730" y="230"
       font-family="Helvetica Neue, Helvetica, Arial, sans-serif"
-      font-size="168" font-weight="700" letter-spacing="6"
+      font-size="223" font-weight="700" letter-spacing="2"
       fill="#FFFFFF">LABS</text>
 </svg>

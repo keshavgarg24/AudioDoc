@@ -132,18 +132,36 @@ export default function App() {
     if (!file || escalating) return
     setEscalating(true)
     setError(null)
+    setCanEscalate(false)
+    // Back to the working view, exactly as a fresh upload does. Leaving the
+    // finished report on screen behind a disabled button meant a minute of
+    // analysis with no progress, no elapsed time and no way to cancel - the
+    // one part of the run where the wait is longest.
+    setResult(null)
+    setPhasesDone(false)
+    setStage(null)
+    setPhase('working')
+    setIsMinimized(false)
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+
     const ctrl = new AbortController()
     abortRef.current = ctrl
     try {
       const { report: deep } = await escalate(file, {
         mode: 'ai', verify, signal: ctrl.signal, onStage: setStage,
       })
-      setReport(deep)
-      saveReport(deep)
-      setCanEscalate(false)
-      window.scrollTo({ top: 0, behavior: 'smooth' })
+      setResult(deep)
     } catch (e) {
-      if (e.name !== 'AbortError') setError(e.message)
+      if (e.name === 'AbortError') {
+        // Cancelled: the quick-check verdict is still valid and still on
+        // screen, so go back to it rather than to an empty page.
+        setPhase('done')
+        setCanEscalate(true)
+        return
+      }
+      setError(e.message)
+      setPhase('done')
+      setCanEscalate(true)
     } finally {
       setEscalating(false)
       abortRef.current = null
@@ -253,8 +271,12 @@ export default function App() {
           </div>
         )}
 
+        {/* During an escalation the chosen mode is still `screen`, but the
+            work actually running is the deep pass, so the phases shown have
+            to be the deep ones. */}
         {phase === 'working' && !isMinimized && (
-          <Processing filename={file?.name || 'audio'} mode={mode} verify={verify}
+          <Processing filename={file?.name || 'audio'}
+                      mode={escalating ? 'ai' : mode} verify={verify}
                       stage={stage}
                       onCancel={() => abortRef.current?.abort()}
                       onHide={() => setIsMinimized(true)}
